@@ -1,0 +1,6 @@
+/target
+*.wav
+/archive
+/kokoro-multi-lang-v1_0
+.idea
+.DS_Store
