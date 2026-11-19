@@ -4,15 +4,15 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-tokio = { version = "1.32.0", features = ["full"] }
-kalosm = { version = " 0.4.0", features = ["sound", "metal"] }
-#sherpa-rs = { version = "0.6.6", features = ["tts", "static", "download-binaries"] }
-sherpa-rs = { git = "https://github.com/thewh1teagle/sherpa-rs", branch = "main", features = ["static", "download-binaries", "tts"]}
-rodio = "0.21.1"
-anyhow = "1.0.98"
-serde = { version = "1.0.219", features = ["derive"] }
-reqwest = { version = "0.11", features = ["json", "stream"] }
-futures = "0.3.31"
-serde_json = "1.0.142"
-futures-util = "0.3.31"
-hound = "3.5.1"
+# speech: sherpa-onnx does STT (Whisper), VAD (Silero), TTS (Kokoro) and WAV;
+# loqui-g2p turns text into Kokoro phonemes; rodio owns the mic and speaker.
+sherpa-onnx = "2.0.1"
+loqui-g2p = "0.4.0"
+rodio = { version = "0.23.0", default-features = false, features = ["playback", "recording"] }
+
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "sync", "time", "signal"] }
+# native-tls = macOS Security.framework: no C/cmake build (the default rustls pulls aws-lc-sys)
+reqwest = { version = "0.13.5", default-features = false, features = ["json", "native-tls", "http2"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+anyhow = "1.0.104"

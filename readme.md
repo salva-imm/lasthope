@@ -1,38 +1,100 @@
-# Rust Voice Assistant: Whisper + Cerebras + Kokoro TTS
+# lasthope
 
-A local, voice-driven AI assistant written in Rust. It captures microphone audio, transcribes it locally, queries a remote LLM, and plays back synthesized speech.
+A personal voice companion written in Rust. You speak, she listens, thinks and answers aloud.
+Hearing and speaking run locally; only the language model call goes to the cloud.
 
-### Core Architecture
+> Work in progress. Phase 1 of 5: solid foundation. Persona, memory, the focus
+> timer's voice and the web UI arrive in later phases.
 
-* **Speech-to-Text (STT):** Local transcription using `kalosm` (Whisper Small).
-* **LLM Inference:** Remote processing via the Cerebras API (`llama-4-scout-17b-16e-instruct`).
-* **Text-to-Speech (TTS):** Local synthesis using `sherpa_rs` (Kokoro TTS).
-* **Audio I/O:** Microphone streaming via `kalosm` and audio playback/file generation via `rodio` and `hound`.
+## How it works
 
-### Prerequisites
+| Part | What | Where |
+|---|---|---|
+| Ears | Silero VAD waits for you to finish a sentence, Whisper small.en transcribes it | local, [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) |
+| Mind | Any OpenAI-compatible chat API (Groq, Cerebras, OpenAI, ollama, …) | cloud (or local server) |
+| Voice | [loqui-g2p](https://crates.io/crates/loqui-g2p) turns text into phonemes, Kokoro speaks them | local, sherpa-onnx |
+| Audio I/O | Microphone and speaker | [rodio](https://crates.io/crates/rodio) |
 
-1. **Kokoro TTS Models:** You need the `kokoro-multi-lang-v1_0` directory in your project root containing `model.onnx`, `voices.bin`, `tokens.txt`, and the respective dictionaries/lexicons.
-2. **Cerebras API Key:** Required for LLM inference.
-3. **System Dependencies:** A working microphone and system audio output.
+sherpa-onnx ships prebuilt static libraries (onnxruntime included), so there is no cmake,
+no C++ toolchain setup and no dylib to manage: `cargo build` is enough.
 
-### Voice Commands
+The microphone is only open while she is listening. It is closed while she thinks or
+speaks, so she never hears herself.
 
-The system continuously listens to your microphone and triggers specific pipelines based on spoken prefixes.
+### Code layout
 
-**1. File Generation Mode**
+```
+src/
+  main.rs        startup, --text flag, wiring
+  config.rs      settings from env / .env
+  core_loop.rs   the state machine: Inputs and Commands in, Events out
+  audio_in.rs    mic -> VAD -> Whisper (and the mic gate)
+  speech_out.rs  text -> phonemes -> Kokoro -> speaker, sentence chunking
+  llm.rs         OpenAI-compatible client
+  persona.rs     system prompt and sampling
+  memory.rs      session transcript (SQLite in phase 3)
+  timer.rs       the vigil (focus timer)
+  text_io.rs     stdin/stdout mode, slash-commands, event printer
+```
 
-* **Triggers:** `please generate...`, `please store...`, `please say...`
-* **Action:** Synthesizes the following text into speech and saves it locally as `output.wav`.
+The core owns all state. Anything that drives it (voice, `--text`, later the web UI)
+sends `Command`s and watches `Event`s:
 
-**2. AI Conversation Mode**
+- Commands: `mute`, `stop_speaking`, `sleep`, `end_session`, `timer_start`, `timer_pause`, `timer_reset`
+- Events: `state_changed`, `user_spoke`, `she_spoke`, `timer_tick`, `memory_changed`, `notice`, `error`, `session_ended`
 
-* **Triggers:** `please ai...`, `colon colon ai...`, `talk to me...`
-* **Action:** Strips the trigger phrase, sends the prompt to Cerebras, chunks the text response, and streams the synthesized audio back through your default speakers using `rodio`.
+## Setup
 
-### Setup & Run
+1. **Rust** 1.87 or newer.
+2. **Speech models** (~450 MB download):
+   ```bash
+   ./scripts/fetch-models.sh
+   ```
+   This puts Kokoro in `./kokoro-multi-lang-v1_0` and Whisper + VAD in `./models` (both gitignored).
+3. **LLM settings**: copy `.env.example` to `.env` and fill in the three values.
+   ```bash
+   LLM_BASE_URL=https://api.groq.com/openai/v1
+   LLM_API_KEY=...
+   LLM_MODEL=...        # check your provider's current model list
+   ```
+   Real environment variables override `.env`. To switch providers, change these three.
+
+## Run
 
 ```bash
-cargo build --release
-cargo run --release
+cargo run --release            # voice: speak into the mic
+cargo run --release -- --text  # type instead: stdin replaces the mic, stdout the speaker
+```
 
+`--text` loads no speech models, so it starts instantly and works without audio hardware.
+Typed lines wait until she has finished replying, so you can also pipe a script:
+
+```bash
+printf 'talk to me, what is the great work?\ntalk to me, and the vigil?\n' | cargo run --release -- --text
+```
+
+### Talking to her (phase 1)
+
+Start what you say with a trigger phrase (removed in phase 2):
+
+- **"talk to me …"**, "please ai …": she answers aloud.
+- **"please say …"**, "please generate …", "please store …": the rest is spoken into `output.wav` (voice mode only).
+
+### Commands
+
+Type these in the terminal, in either mode:
+
+```
+/mute  /unmute               deafen her (closes the mic) / let her hear again
+/stop                        silence her: cut off the current reply
+/sleep /wake                 pause / resume listening
+/timer start|pause|reset     the vigil (25 min)
+/end                         end the session (also Ctrl-C)
+```
+
+## Tests
+
+```bash
+cargo test --release                    # unit tests
+cargo test --release -- --ignored       # + Kokoro -> Whisper round trip (needs the models)
 ```

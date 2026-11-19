@@ -1,6 +1,14 @@
 /target
-*.wav
-/archive
-/kokoro-multi-lang-v1_0
 .idea
 .DS_Store
+
+# secrets
+.env
+
+# speech models (scripts/fetch-models.sh) and local leftovers
+/models
+/kokoro-multi-lang-v1_0
+/archive
+
+# generated audio
+*.wav

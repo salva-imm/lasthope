@@ -1,231 +1,88 @@
-use std::time::Duration;
-use tokio::sync::mpsc;
-use std::collections::BTreeMap;
+//! lasthope: a local voice companion.
+//!
+//! Ears (Whisper + VAD) and voice (Kokoro) run locally through sherpa-onnx;
+//! only the LLM call leaves the machine. See readme.md.
 
-use std::error::Error;
+mod audio_in;
+mod config;
+mod core_loop;
+mod llm;
+mod memory;
+mod persona;
+mod speech_out;
+mod text_io;
+mod timer;
 
-use rodio::buffer::SamplesBuffer;
-use rodio::{OutputStream, Sink};
-use std::path::Path;
-use sherpa_rs::tts::{KokoroTts, KokoroTtsConfig};
-use serde::{Deserialize, Serialize};
-use serde::de::StdError;
-use tokio::fs;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
-#[derive(Serialize)]
-struct CerebrasRequest {
-    model: String,
-    stream: bool,
-    messages: Vec<Message>,
-    temperature: f32,
-    max_tokens: i32,
-    seed: i32,
-    top_p: f32,
-}
+use anyhow::Result;
 
-#[derive(Serialize)]
-struct Message {
-    content: String,
-    role: String,
-}
+use crate::audio_in::Gate;
+use crate::config::Config;
+use crate::core_loop::{Command, Core, Input};
+use crate::llm::LlmClient;
+use crate::speech_out::{Mouth, Voice};
 
-#[derive(Deserialize)]
-struct CerebrasResponse {
-    choices: Vec<Choice>,
-}
+const USAGE: &str = "\
+usage: lasthope [--text]
 
-#[derive(Deserialize)]
-struct Choice {
-    message: MessageResponse,
-}
+  --text   type instead of speaking: stdin replaces the mic, stdout the speaker
+           (no speech models are loaded)
 
-#[derive(Deserialize)]
-struct MessageResponse {
-    content: String,
-}
-
-fn split_into_chunks(text: &str, max_len: usize) -> Vec<String> {
-    let mut chunks = vec![];
-    let mut current = String::new();
-
-    for sentence in text.split_terminator('.') {
-        let sentence = sentence.trim();
-        if sentence.is_empty() { continue; }
-        if current.len() + sentence.len() + 1 > max_len {
-            chunks.push(current.trim().to_string());
-            current.clear();
-        }
-        current.push_str(sentence);
-        current.push('.');
-    }
-    if !current.is_empty() {
-        chunks.push(current.trim().to_string());
-    }
-    chunks
-}
-
-async fn ask_cerebras(prompt: &str, api_key: &str) -> Result<String, Box<dyn Error>> {
-    let client = reqwest::Client::new();
-
-    let system_message = Message {
-        role: "system".into(),
-        content: "Please do not include any asterisks (*) in your replies. Skip or remove them entirely.".into(),
-    };
-
-    let user_message = Message {
-        role: "user".into(),
-        content: prompt.to_string(),
-    };
-
-    let body = CerebrasRequest {
-        model: "llama-4-scout-17b-16e-instruct".into(),
-        stream: false,
-        messages: vec![system_message, user_message],
-        temperature: 0.0,
-        max_tokens: -1,
-        seed: 0,
-        top_p: 1.0,
-    };
-
-    let res = client
-        .post("https://api.cerebras.ai/v1/chat/completions")
-        .header("Authorization", format!("Bearer {}", api_key))
-        .json(&body)
-        .send()
-        .await?;
-
-    let text = res.text().await?;
-    // println!("Raw response: {}", text);
-
-    let parsed: CerebrasResponse = serde_json::from_str(&text)?;
-
-    Ok(parsed.choices[0].message.content.clone())
-}
-
-async fn tts_to_audio(tts_engine: &mut KokoroTts, text: &str) -> Result<(Vec<f32>, u32), Box<dyn StdError + Send + Sync>> {
-    let audio = tts_engine.create(text, 2, 1.0)?;
-    Ok((audio.samples, audio.sample_rate))
-}
-
-async fn tts_to_file(
-    tts_engine: &mut KokoroTts,
-    text: &str,
-    filename: &str,
-) -> Result<(), Box<dyn StdError + Send + Sync>> {
-    let (samples, sample_rate) = tts_to_audio(tts_engine, text).await?;
-    // Convert f32 samples to i16 WAV format
-    let mut wav_writer = hound::WavWriter::create(filename, hound::WavSpec {
-        channels: 1,
-        sample_rate,
-        bits_per_sample: 16,
-        sample_format: hound::SampleFormat::Int,
-    })?;
-    for sample in samples {
-        let s = (sample * i16::MAX as f32) as i16;
-        wav_writer.write_sample(s)?;
-    }
-    wav_writer.finalize()?;
-    Ok(())
-}
-
-fn normalize_command(text: &str) -> String {
-    let lowered = text.to_lowercase();
-    lowered
-        .replace("colon colon ai", "::ai")
-        .replace("colon colon say", "::say")
-}
+settings (environment or .env): LLM_BASE_URL, LLM_API_KEY, LLM_MODEL
+optional: KOKORO_DIR (./kokoro-multi-lang-v1_0), MODELS_DIR (./models)";
 
 #[tokio::main]
-async fn main() {
-    use kalosm::sound::*;
-    let cerebras_api_key = "YOUR_KEY";
-    let whisper = Whisper::builder()
-        .with_source(WhisperSource::Small)
-        .build()
-        .await
-        .expect("Failed to load Whisper");
+async fn main() -> Result<()> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.iter().any(|a| a == "-h" || a == "--help") {
+        println!("{USAGE}\n\n{}", text_io::COMMANDS_HELP);
+        return Ok(());
+    }
+    if let Some(bad) = args.iter().find(|a| *a != "--text") {
+        anyhow::bail!("unknown argument {bad:?}\n\n{USAGE}");
+    }
+    let text_mode = args.iter().any(|a| a == "--text");
 
-    let config = KokoroTtsConfig {
-        model: "./kokoro-multi-lang-v1_0/model.onnx".to_string(),
-        voices: "./kokoro-multi-lang-v1_0/voices.bin".into(),
-        tokens: "./kokoro-multi-lang-v1_0/tokens.txt".into(),
-        data_dir: "./kokoro-multi-lang-v1_0/espeak-ng-data".into(),
-        dict_dir: "./kokoro-multi-lang-v1_0/dict".into(),
-        lexicon: "./kokoro-multi-lang-v1_0/lexicon-us-en.txt,./kokoro-multi-lang-v1_0/lexicon-zh.txt".into(),
-        length_scale: 1.0,
-        ..Default::default()
+    let cfg = Config::load()?;
+    let llm = LlmClient::new(cfg.llm.clone())?;
+    let (handle, inputs) = core_loop::channel();
+    let gate = Gate::new(false);
+    let pacer = core_loop::Pacer::default();
+
+    let mouth: Arc<dyn Mouth> = if text_mode {
+        Arc::new(text_io::TextMouth)
+    } else {
+        let t = Instant::now();
+        eprintln!("loading voice and ears…");
+        let voice = Voice::spawn(&cfg)?;
+        let h = handle.clone();
+        audio_in::spawn(&cfg, gate.clone(), move |text| h.send(Input::Heard(text)))?;
+        eprintln!("models loaded in {:.1}s", t.elapsed().as_secs_f32());
+        Arc::new(voice)
     };
 
-    let mut tts_engine = KokoroTts::new(config);
-
-    loop {
-        let mic = MicInput::default();
-        let stream = mic.stream();
-        let mut transcribe = stream.transcribe(whisper.clone());
-        let mut text = String::new();
-        println!("Listening ...");
-        while let Some(segment) = transcribe.next().await {
-            text = segment.text().parse().unwrap();
-            text = text.trim().to_lowercase();
-            if !text.trim().is_empty() {
-                println!("Transcribed: {}", text);
-                break;
+    text_io::spawn_stdin(handle.clone(), pacer.clone(), text_mode);
+    let echo_user = !text_mode || !text_io::stdin_is_terminal();
+    let printer = tokio::spawn(text_io::print_events(handle.subscribe(), echo_user));
+    {
+        let h = handle.clone();
+        tokio::spawn(async move {
+            if tokio::signal::ctrl_c().await.is_ok() {
+                h.command(Command::EndSession);
             }
-        }
-        drop(transcribe);
-
-
-        if text.starts_with("please generate") || text.starts_with("please store") || text.starts_with("please say") {
-            println!("INSIDE VOICE GENERATION BLOCK");
-
-            // remove the command
-            let content = text
-                .trim_start_matches("please generate")
-                .trim_start_matches("please store")
-                .trim_start_matches("please say")
-                .trim();
-            if !content.is_empty() {
-                println!("Simple TTS: {}", content);
-                if let Err(e) = tts_to_file(&mut tts_engine, content, "output.wav").await {
-                    eprintln!("Failed to save TTS file: {}", e);
-                } else {
-                    println!("Saved speech to output.wav");
-                }
-            }
-        } else if text.starts_with("please ai") || text.starts_with("colon colon ai") || text.starts_with("talk to me") {
-            println!("INSIDE AI BLOCK");
-            // Normal AI conversation
-            let prompt = text
-                .trim_start_matches("please ai")
-                .trim_start_matches("colon colon ai")
-                .trim_start_matches("talk to me")
-                .trim();
-            match ask_cerebras(prompt, &cerebras_api_key).await {
-                Ok(reply) => {
-                    println!("AI: {}", reply);
-                    let chunks: Vec<_> = split_into_chunks(&reply, 80)
-                        .into_iter()
-                        .filter(|c| !c.trim().is_empty())
-                        .collect();
-
-                    let (_stream, handle) = rodio::OutputStream::try_default()
-                        .expect("failed to open audio output");
-                    let sink = rodio::Sink::try_new(&handle)
-                        .expect("failed to create sink");
-
-                    for chunk in chunks {
-                        match tts_to_audio(&mut tts_engine, &chunk).await {
-                            Ok((samples, sample_rate)) => {
-                                let src = rodio::buffer::SamplesBuffer::new(1, sample_rate, samples);
-                                sink.append(src);
-                            }
-                            Err(e) => eprintln!("TTS failed: {}", e),
-                        }
-                    }
-                    sink.sleep_until_end();
-                }
-                Err(e) => eprintln!("AI request failed: {}", e),
-            }
-        }
+        });
     }
+
+    eprintln!(
+        "lasthope: {} mode, mind = {} — /help for commands, Ctrl-C to end",
+        if text_mode { "text" } else { "voice" },
+        llm.model()
+    );
+
+    let memory = Core::new(llm, mouth, gate, pacer, handle, inputs).run().await;
+    let _ = tokio::time::timeout(Duration::from_secs(1), printer).await;
+    eprintln!("  · {} lines spoken this session", memory.transcript().len());
+    Ok(())
 }
