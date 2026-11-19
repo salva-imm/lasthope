@@ -138,6 +138,11 @@ A session left open by a crash is sealed (and summarized) on the next start; a s
 failed (e.g. rate limit) is retried then too. On first run the great work is: *Master Rust, EVM
 internals and networking, with at least twenty-five minutes of focused work every day.*
 
+When the LLM provider pushes back (429 rate limit, 5xx, timeout or dropped connection) the
+request is retried up to four times, and she says so once per reply: *"Retrying, the API hit
+the limit."* or *"Retrying, the API is not answering."* If every try fails she says that too
+(*"…Give it a minute, then speak again."*). These status lines are never saved to memory.
+
 ### Commands
 
 Type these in the terminal, in either mode:

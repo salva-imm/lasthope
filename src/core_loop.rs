@@ -22,7 +22,7 @@ use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
 
 use crate::audio_in::Gate;
-use crate::llm::{ChatMessage, LlmClient};
+use crate::llm::{self, ChatMessage, LlmClient, Trouble};
 use crate::memory::{Memory, Speaker};
 use crate::persona::{self, Persona, Snapshot};
 use crate::rite::{Action, Rite, Situation};
@@ -184,6 +184,8 @@ enum Turn {
 }
 
 enum Done {
+    /// The LLM request is being retried; the reply is still coming.
+    Retrying(Trouble),
     Reply(Result<String>),
     Spoke(Result<()>),
     Saved(Result<()>),
@@ -273,6 +275,8 @@ pub struct Core {
     deferred: Option<Situation>,
     /// What the reply in flight is about.
     replying_to: Option<Situation>,
+    /// Why the reply in flight is being retried (she says it once per turn).
+    trouble: Option<Trouble>,
 }
 
 impl Core {
@@ -315,6 +319,7 @@ impl Core {
             last_heard: String::new(),
             deferred: None,
             replying_to: None,
+            trouble: None,
         }
     }
 
@@ -614,6 +619,13 @@ impl Core {
         if id != self.turn_id || self.turn == Turn::Idle {
             return Flow::Continue; // a turn that was cancelled
         }
+        if let Done::Retrying(trouble) = done {
+            // say it once per turn; the request keeps going
+            if self.turn == Turn::Thinking && self.trouble.replace(trouble).is_none() {
+                self.say_status(trouble.retrying_line());
+            }
+            return Flow::Continue;
+        }
         self.task = None;
         match done {
             Done::Reply(Ok(raw)) => {
@@ -631,9 +643,17 @@ impl Core {
                 }
                 self.emit(Event::Error { message: format!("unspeakable reply: {raw:?}") });
             }
-            Done::Reply(Err(e)) => self.emit(Event::Error { message: format!("{e:#}") }),
+            Done::Reply(Err(e)) => {
+                self.emit(Event::Error { message: format!("{e:#}") });
+                self.replying_to = None;
+                let line = self.trouble.take().map_or(llm::FAILED_LINE, Trouble::gave_up_line);
+                // spoken, but not part of the conversation: never saved
+                self.notice(line);
+                self.start_speaking(line.to_string());
+                return Flow::Continue;
+            }
             Done::Spoke(Err(e)) => self.emit(Event::Error { message: format!("voice: {e:#}") }),
-            Done::Spoke(Ok(())) => {}
+            Done::Spoke(Ok(())) | Done::Retrying(_) => {}
             Done::Saved(Ok(())) => self.notice(format!("saved speech to {WAV_PATH}")),
             Done::Saved(Err(e)) => self.emit(Event::Error { message: format!("save: {e:#}") }),
         }
@@ -707,13 +727,24 @@ impl Core {
             }
         };
         self.replying_to = Some(situation);
+        self.trouble = None;
         let sampling = self.persona.sampling();
         let llm = self.llm.clone();
         let tx = self.done_tx.clone();
         self.task = Some(tokio::spawn(async move {
-            let reply = llm.chat(&messages, sampling).await;
+            let on_retry = |t| {
+                let _ = tx.send((id, Done::Retrying(t)));
+            };
+            let reply = llm.chat_reporting(&messages, sampling, on_retry).await;
             let _ = tx.send((id, Done::Reply(reply)));
         }));
+    }
+
+    /// A short status line while she is still thinking: shown, and spoken
+    /// without changing her turn (the mic stays closed while she thinks).
+    fn say_status(&self, line: &str) {
+        self.notice(line);
+        let _ = self.mouth.speak(line.to_string(), Arc::new(AtomicBool::new(false)));
     }
 
     fn start_speaking(&mut self, text: String) {

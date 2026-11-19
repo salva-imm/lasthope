@@ -81,6 +81,17 @@ impl LlmClient {
     }
 
     pub async fn chat(&self, messages: &[ChatMessage], sampling: Sampling) -> Result<String> {
+        self.chat_reporting(messages, sampling, |_| {}).await
+    }
+
+    /// Like `chat`, but calls `on_retry` each time a failed attempt is about
+    /// to be retried, so the caller can tell the user what is going on.
+    pub async fn chat_reporting(
+        &self,
+        messages: &[ChatMessage],
+        sampling: Sampling,
+        on_retry: impl Fn(Trouble),
+    ) -> Result<String> {
         let url = format!("{}/chat/completions", self.cfg.base_url);
         let body = Request {
             model: &self.cfg.model,
@@ -93,14 +104,19 @@ impl LlmClient {
         let mut attempt = 0;
         let text = loop {
             attempt += 1;
-            let res = self
-                .http
-                .post(&url)
-                .bearer_auth(&self.cfg.api_key)
-                .json(&body)
-                .send()
-                .await
-                .with_context(|| format!("request to {url} failed"))?;
+            let sent = self.http.post(&url).bearer_auth(&self.cfg.api_key).json(&body).send().await;
+            let res = match sent {
+                Ok(res) => res,
+                // timeouts and dropped connections: worth another try
+                Err(e) if attempt < MAX_ATTEMPTS && (e.is_timeout() || e.is_connect() || e.is_request()) => {
+                    let wait = 2.0 * attempt as f64;
+                    eprintln!("  · the mind is unreachable ({e}); retrying in {wait:.0}s");
+                    on_retry(Trouble::Unavailable);
+                    tokio::time::sleep(Duration::from_secs_f64(wait)).await;
+                    continue;
+                }
+                Err(e) => return Err(e).with_context(|| format!("request to {url} failed")),
+            };
             let status = res.status();
             let retry_after = res
                 .headers()
@@ -111,8 +127,12 @@ impl LlmClient {
             if status.is_success() {
                 break text;
             }
-            let retryable = status.as_u16() == 429 || status.as_u16() == 503;
-            if !retryable || attempt >= MAX_ATTEMPTS {
+            let trouble = match status.as_u16() {
+                429 => Trouble::RateLimited,
+                500 | 502 | 503 | 504 | 529 => Trouble::Unavailable,
+                _ => bail!("LLM returned {status}: {}", truncate(&text, 400)),
+            };
+            if attempt >= MAX_ATTEMPTS {
                 bail!("LLM returned {status}: {}", truncate(&text, 400));
             }
             let wait = retry_after
@@ -120,6 +140,7 @@ impl LlmClient {
                 .unwrap_or(2.0 * attempt as f64)
                 .clamp(0.5, MAX_RETRY_WAIT_SECS);
             eprintln!("  · the mind is busy ({status}); retrying in {wait:.1}s");
+            on_retry(trouble);
             tokio::time::sleep(Duration::from_secs_f64(wait)).await;
         };
         let parsed: Response = serde_json::from_str(&text)
@@ -134,6 +155,36 @@ impl LlmClient {
             .ok_or_else(|| anyhow!("LLM returned no content"))
     }
 }
+
+/// Why a request is being retried.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Trouble {
+    /// 429: the provider's rate limit (tokens or requests per minute).
+    RateLimited,
+    /// 5xx, a timeout or a dropped connection.
+    Unavailable,
+}
+
+impl Trouble {
+    /// What she says while retrying.
+    pub fn retrying_line(self) -> &'static str {
+        match self {
+            Trouble::RateLimited => "Retrying, the API hit the limit.",
+            Trouble::Unavailable => "Retrying, the API is not answering.",
+        }
+    }
+
+    /// What she says when the retries are used up.
+    pub fn gave_up_line(self) -> &'static str {
+        match self {
+            Trouble::RateLimited => "The API is still at its limit. Give it a minute, then speak again.",
+            Trouble::Unavailable => "The API is not answering. Speak again in a moment.",
+        }
+    }
+}
+
+/// What she says when a request fails without being retried.
+pub const FAILED_LINE: &str = "The API failed. Speak again in a moment.";
 
 const MAX_ATTEMPTS: u32 = 4;
 const MAX_RETRY_WAIT_SECS: f64 = 15.0;

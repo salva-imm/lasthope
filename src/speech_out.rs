@@ -27,7 +27,7 @@ const SPEED: f32 = 1.0;
 const LEAD_IN_MS: usize = 200;
 
 /// Words the phonemizer would get wrong, rewritten before phonemizing.
-const PRONUNCIATIONS: &[(&str, &str)] = &[("lasthope", "Last Hope")];
+const PRONUNCIATIONS: &[(&str, &str)] = &[("lasthope", "Last Hope"), ("API", "A P I")];
 
 /// Something that can say things. Voice mode speaks aloud; text mode prints.
 pub trait Mouth: Send + Sync {
@@ -359,6 +359,7 @@ mod tests {
         assert_eq!(for_speech("**Rise**, #seeker"), "Rise, seeker");
         assert_eq!(for_speech("Welcome to LASTHOPE."), "Welcome to Last Hope.");
         assert_eq!(for_speech("lasthope's door"), "Last Hope's door");
+        assert_eq!(for_speech("Retrying, the API hit the limit."), "Retrying, the A P I hit the limit.");
     }
 }
 
