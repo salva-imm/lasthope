@@ -12,3 +12,6 @@
 
 # generated audio
 *.wav
+
+# LASTHOPE_DEBUG_AUDIO dumps
+/debug-audio

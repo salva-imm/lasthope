@@ -310,3 +310,4 @@ mod tests {
         assert_eq!(for_speech("lasthope's door"), "Last Hope's door");
     }
 }
+

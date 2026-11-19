@@ -25,6 +25,9 @@ use crate::speech_out::Mouth;
 use crate::timer::{DEFAULT_VIGIL, Vigil};
 
 const WAV_PATH: &str = "output.wav";
+/// After a bare trigger phrase ("talk to me" + pause), the next utterance
+/// within this window is taken as the request.
+const ARMED_FOR: Duration = Duration::from_secs(15);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -108,6 +111,12 @@ struct PacerState {
 }
 
 impl Pacer {
+    /// True when a line sent now would be heard straight away.
+    pub fn is_free(&self) -> bool {
+        let s = self.0.0.lock().unwrap();
+        !s.busy && s.pending == 0
+    }
+
     /// Block until she is free, then reserve the next line.
     pub fn wait_and_claim(&self) {
         let (lock, cvar) = &*self.0;
@@ -201,6 +210,8 @@ pub struct Core {
     task: Option<JoinHandle<()>>,
     end_when_idle: bool,
     published: Option<(State, bool)>,
+    /// A trigger phrase heard on its own, waiting for the request that follows.
+    armed: Option<(Route, Instant)>,
 }
 
 impl Core {
@@ -233,6 +244,7 @@ impl Core {
             task: None,
             end_when_idle: false,
             published: None,
+            armed: None,
         }
     }
 
@@ -311,10 +323,26 @@ impl Core {
         }
         self.memory.record(Speaker::Me, text);
         self.emit(Event::UserSpoke { text: text.to_string() });
-        match route(text) {
+        let mut route = route(text);
+        // "talk to me" ... pause ... "tell me about Rust": join the two
+        if route == Route::Ignore {
+            if let Some((armed, at)) = self.armed.take() {
+                if at.elapsed() < ARMED_FOR {
+                    route = match armed {
+                        Route::SaveWav(_) => Route::SaveWav(text.to_string()),
+                        _ => Route::Ask(text.to_string()),
+                    };
+                }
+            }
+        }
+        self.armed = None;
+        match route {
             Route::Ask(prompt) if !prompt.is_empty() => self.start_reply(prompt),
             Route::SaveWav(content) if !content.is_empty() => self.start_save(content),
-            Route::Ask(_) | Route::SaveWav(_) => self.notice("say something after the trigger phrase"),
+            r @ (Route::Ask(_) | Route::SaveWav(_)) => {
+                self.armed = Some((r, Instant::now()));
+                self.notice("she waits for your words");
+            }
             Route::Ignore => self.notice(
                 "no trigger phrase; start with \"talk to me\" (or \"please say\" to save output.wav)",
             ),

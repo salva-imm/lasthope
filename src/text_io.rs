@@ -54,6 +54,7 @@ fn parse_command(line: &str) -> Option<Result<Command, String>> {
         ["timer", "start"] | ["begin"] => Ok(Command::TimerStart),
         ["timer", "pause"] | ["hold"] => Ok(Command::TimerPause),
         ["timer", "reset"] | ["anew"] => Ok(Command::TimerReset),
+        ["timer", ..] => Err("usage: /timer start | /timer pause | /timer reset".to_string()),
         _ => Err(COMMANDS_HELP.to_string()),
     })
 }
@@ -76,6 +77,9 @@ pub fn spawn_stdin(handle: CoreHandle, pacer: Pacer, end_on_eof: bool) {
                     Some(Ok(cmd)) => handle.command(cmd),
                     Some(Err(help)) => eprintln!("{help}"),
                     None => {
+                        if !pacer.is_free() {
+                            eprintln!("  · she is not done yet; your words wait their turn");
+                        }
                         pacer.wait_and_claim();
                         handle.send(Input::Heard(line.to_string()));
                     }
@@ -156,6 +160,7 @@ mod tests {
         assert_eq!(parse_command("/timer  start"), Some(Ok(Command::TimerStart)));
         assert_eq!(parse_command("/end"), Some(Ok(Command::EndSession)));
         assert!(matches!(parse_command("/nope"), Some(Err(_))));
+        assert!(matches!(parse_command("/timer"), Some(Err(e)) if e.starts_with("usage: /timer")));
         assert_eq!(parse_command("talk to me"), None);
     }
 }
