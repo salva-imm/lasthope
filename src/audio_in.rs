@@ -3,7 +3,14 @@
 //! The mic is only open while the gate is open. The core closes the gate
 //! whenever she is not listening (thinking, speaking, asleep, deafened), and
 //! the mic thread then drops the input stream, so she never hears herself.
-//! VAD waits for a pause before transcribing, so long sentences are kept whole.
+//!
+//! The VAD finds stretches of speech; a turn ends only after a longer silence
+//! (END_OF_TURN_MS, default 1.2 s), and the whole turn is transcribed at once,
+//! so thinking pauses don't split a sentence and Whisper gets full context.
+//!
+//! Bluetooth headsets drop to phone-call quality (16 kHz, both directions)
+//! while their mic is open, so by default the headset's own mic is avoided
+//! when another one (e.g. the laptop's) exists. MIC_DEVICE overrides this.
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc as std_mpsc;
@@ -13,7 +20,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
 use rodio::Source;
-use rodio::microphone::{Microphone, MicrophoneBuilder};
+use rodio::cpal::traits::{DeviceTrait, HostTrait};
+use rodio::microphone::{Input, Microphone, MicrophoneBuilder, available_inputs};
 use sherpa_onnx::{
     LinearResampler, OfflineRecognizer, OfflineRecognizerConfig, VadModelConfig,
     VoiceActivityDetector,
@@ -23,6 +31,8 @@ use crate::config::Config;
 
 const SAMPLE_RATE: i32 = 16_000;
 const WHISPER_DIR: &str = "sherpa-onnx-whisper-small.en";
+/// Silence that closes one VAD speech segment (a turn may hold several).
+const SEGMENT_SILENCE: f32 = 0.5;
 
 /// Open/closed switch for the microphone, shared between the core and the
 /// capture thread.
@@ -69,16 +79,20 @@ enum Chunk {
     Closed,
 }
 
-/// Load the models and start listening. Every finished utterance is passed
-/// to `on_heard`. Returns once the models are loaded (or failed to).
+/// Load the models and start listening. Every finished turn is passed to
+/// `on_heard`. Returns once the models are loaded (or failed to).
 ///
 /// Two threads: "mic" only drains the microphone (rodio keeps just 100 ms of
 /// audio and silently drops the rest if nobody reads it), "transcriber" runs
 /// VAD and Whisper. Slow transcription can therefore never lose speech.
 ///
-/// Set `LASTHOPE_DEBUG_AUDIO=1` to save every utterance to `debug-audio/`.
+/// Set `LASTHOPE_DEBUG_AUDIO=1` to save every turn to `debug-audio/`.
 pub fn spawn(cfg: &Config, gate: Gate, on_heard: impl Fn(String) + Send + 'static) -> Result<()> {
+    // fail fast on a MIC_DEVICE that matches nothing
+    choose_input(cfg.mic_device.as_deref())?;
     let models = cfg.models_dir.clone();
+    let mic_pref = cfg.mic_device.clone();
+    let turn_gap = (cfg.end_of_turn.as_secs_f64() * SAMPLE_RATE as f64) as i64;
     let debug_dir = std::env::var("LASTHOPE_DEBUG_AUDIO")
         .ok()
         .filter(|v| !v.is_empty() && v != "0")
@@ -96,19 +110,22 @@ pub fn spawn(cfg: &Config, gate: Gate, on_heard: impl Fn(String) + Send + 'stati
                 return;
             }
         };
-        ears.transcribe_loop(rx, &on_heard, debug_dir);
+        ears.transcribe_loop(rx, &on_heard, turn_gap, debug_dir);
     })?;
     init_rx.recv().context("transcriber thread died while loading")??;
-    thread::Builder::new().name("mic".into()).spawn(move || capture_loop(&gate, &tx))?;
+    thread::Builder::new()
+        .name("mic".into())
+        .spawn(move || capture_loop(&gate, &tx, mic_pref.as_deref()))?;
     Ok(())
 }
 
 /// Mic thread: open the mic while the gate is open, forward 50 ms mono chunks.
-fn capture_loop(gate: &Gate, tx: &std_mpsc::Sender<Chunk>) {
+fn capture_loop(gate: &Gate, tx: &std_mpsc::Sender<Chunk>, mic_pref: Option<&str>) {
     let mut announced = None;
     loop {
         gate.wait_open();
-        let mut mic = match open_mic() {
+        // chosen on every opening, so plugging headphones in or out is followed
+        let (mut mic, name) = match open_mic(mic_pref) {
             Ok(m) => m,
             Err(e) => {
                 eprintln!("  ! microphone: {e:#}; retrying in 2s");
@@ -118,9 +135,10 @@ fn capture_loop(gate: &Gate, tx: &std_mpsc::Sender<Chunk>) {
         };
         let channels = mic.channels().get() as usize;
         let rate = mic.sample_rate().get();
-        if announced != Some((rate, channels)) {
-            eprintln!("  (mic: {rate} Hz, {channels} ch)");
-            announced = Some((rate, channels));
+        let now = (name, rate, channels);
+        if announced.as_ref() != Some(&now) {
+            eprintln!("  (mic: {}, {rate} Hz, {channels} ch)", now.0);
+            announced = Some(now);
         }
         let window = (rate / 20) as usize;
         'read: loop {
@@ -149,6 +167,86 @@ fn capture_loop(gate: &Gate, tx: &std_mpsc::Sender<Chunk>) {
     }
 }
 
+fn device_name(d: &rodio::cpal::Device) -> Option<String> {
+    d.description().ok().map(|d| d.name().to_string())
+}
+
+/// Which mic to open. `None` means the system default.
+/// - MIC_DEVICE=default: the system default.
+/// - MIC_DEVICE=<text>: the first input whose name contains it.
+/// - unset: the default, unless it is the same device as the default output
+///   (a headset) and another input exists: then that other input.
+fn choose_input(pref: Option<&str>) -> Result<Option<Input>> {
+    let inputs = available_inputs()?;
+    match pref {
+        Some(p) if p.eq_ignore_ascii_case("default") => Ok(None),
+        Some(p) => {
+            let wanted = p.to_lowercase();
+            let names: Vec<String> = inputs.iter().map(|i| i.to_string()).collect();
+            inputs
+                .into_iter()
+                .find(|i| i.to_string().to_lowercase().contains(&wanted))
+                .map(Some)
+                .ok_or_else(|| anyhow!("no microphone matches MIC_DEVICE={p:?}; available: {}", names.join(", ")))
+        }
+        None => {
+            let host = rodio::cpal::default_host();
+            let default_in = host.default_input_device().and_then(|d| device_name(&d));
+            let default_out = host.default_output_device().and_then(|d| device_name(&d));
+            if default_in.is_some() && default_in == default_out {
+                Ok(inputs.into_iter().find(|i| Some(i.to_string()) != default_in))
+            } else {
+                Ok(None)
+            }
+        }
+    }
+}
+
+/// For `--mics`: list inputs and say which one would be used.
+pub fn describe_mics(pref: Option<&str>) -> Result<String> {
+    let host = rodio::cpal::default_host();
+    let default_in = host.default_input_device().and_then(|d| device_name(&d));
+    let default_out = host.default_output_device().and_then(|d| device_name(&d));
+    let mut out = String::from("microphones:\n");
+    for input in available_inputs()? {
+        let name = input.to_string();
+        let tag = if Some(&name) == default_in.as_ref() { "  (system default)" } else { "" };
+        out.push_str(&format!("  {name}{tag}\n"));
+    }
+    out.push_str(&format!("speaker: {}\n", default_out.as_deref().unwrap_or("none")));
+    let chosen = match choose_input(pref)? {
+        Some(i) => i.to_string(),
+        None => default_in.unwrap_or_else(|| "none".into()),
+    };
+    out.push_str(&format!("she will listen through: {chosen}"));
+    if pref.is_none() && Some(&chosen) != host.default_input_device().and_then(|d| device_name(&d)).as_ref() {
+        out.push_str("  (the default mic is your headset's: avoided, it would drop the headset to call quality)");
+    }
+    Ok(out)
+}
+
+fn open_mic(pref: Option<&str>) -> Result<(Microphone, String)> {
+    let (builder, name) = match choose_input(pref)? {
+        Some(input) => {
+            let name = input.to_string();
+            (MicrophoneBuilder::new().device(input)?, name)
+        }
+        None => {
+            let name = rodio::cpal::default_host()
+                .default_input_device()
+                .and_then(|d| device_name(&d))
+                .unwrap_or_else(|| "default".into());
+            (MicrophoneBuilder::new().default_device()?, name)
+        }
+    };
+    let mic = builder
+        .default_config()?
+        .prefer_channel_counts([1.try_into().unwrap()])
+        .prefer_sample_rates([16_000.try_into().unwrap()])
+        .open_stream()?;
+    Ok((mic, name))
+}
+
 impl Ears {
     pub(crate) fn load(models: &Path) -> Result<Self> {
         let whisper = models.join(WHISPER_DIR);
@@ -174,8 +272,7 @@ impl Ears {
         let mut v = VadModelConfig::default();
         v.silero_vad.model = Some(file(models.join("silero_vad.onnx"))?);
         v.silero_vad.threshold = 0.5;
-        // How long a pause ends an utterance. Long enough to breathe mid-thought.
-        v.silero_vad.min_silence_duration = 0.8;
+        v.silero_vad.min_silence_duration = SEGMENT_SILENCE;
         v.silero_vad.min_speech_duration = 0.25;
         v.silero_vad.max_speech_duration = 30.0;
         v.silero_vad.window_size = 512;
@@ -186,22 +283,51 @@ impl Ears {
         Ok(Self { asr, vad })
     }
 
-    /// Transcriber thread: VAD finds utterances, Whisper turns them into text.
+    /// Transcriber thread: the VAD finds speech, segments are gathered into a
+    /// turn, and a turn is transcribed once `turn_gap` samples of silence follow.
     fn transcribe_loop(
         &self,
         rx: std_mpsc::Receiver<Chunk>,
         on_heard: &dyn Fn(String),
+        turn_gap: i64,
         debug_dir: Option<PathBuf>,
     ) {
         let mut resampler: Option<(u32, LinearResampler)> = None;
         let mut history = History::default();
+        let mut turn = Turn::default();
         let mut saved = 0u32;
+        let finish = |span: (i64, i64), history: &History, saved: &mut u32| {
+            let speech = history.slice(span.0, span.1);
+            let started = Instant::now();
+            let text = self.transcribe(speech);
+            eprintln!(
+                "  ({:.1}s of speech, transcribed in {} ms)",
+                speech.len() as f32 / SAMPLE_RATE as f32,
+                started.elapsed().as_millis()
+            );
+            if let Some(dir) = &debug_dir {
+                *saved += 1;
+                let _ = std::fs::create_dir_all(dir);
+                let heard = dir.join(format!("heard-{saved:03}.wav"));
+                let context = dir.join(format!("context-{saved:03}.wav"));
+                sherpa_onnx::write(&heard.to_string_lossy(), speech, SAMPLE_RATE);
+                let lead_in = history.slice(span.0 - CONTEXT, span.1);
+                sherpa_onnx::write(&context.to_string_lossy(), lead_in, SAMPLE_RATE);
+                eprintln!("  (saved {}: {text:?})", heard.display());
+            }
+            if let Some(text) = clean_transcript(&text) {
+                on_heard(text);
+            }
+        };
+
         for chunk in rx {
             let (samples, rate) = match chunk {
                 Chunk::Audio { samples, rate } => (samples, rate),
                 Chunk::Closed => {
+                    // mic closed mid-turn (she started speaking, muted, ...): drop it
                     self.vad.reset();
                     history = History::default();
+                    turn = Turn::default();
                     if let Some((_, r)) = &resampler {
                         r.reset();
                     }
@@ -226,30 +352,21 @@ impl Ears {
             history.push(&samples);
 
             while let Some(segment) = self.vad.front() {
-                // The VAD fires a little after a soft first word begins ("t" of
-                // "talk"); give Whisper the audio just before it too.
-                let speech = history.with_preroll(segment.start(), segment.samples());
+                turn.add_segment(segment.start(), segment.n() as i64);
                 self.vad.pop();
-                let started = Instant::now();
-                let text = self.transcribe(&speech);
-                eprintln!(
-                    "  ({:.1}s of speech, transcribed in {} ms)",
-                    speech.len() as f32 / SAMPLE_RATE as f32,
-                    started.elapsed().as_millis()
-                );
-                if let Some(dir) = &debug_dir {
-                    saved += 1;
-                    let _ = std::fs::create_dir_all(dir);
-                    let heard = dir.join(format!("heard-{saved:03}.wav"));
-                    let context = dir.join(format!("context-{saved:03}.wav"));
-                    sherpa_onnx::write(&heard.to_string_lossy(), &speech, SAMPLE_RATE);
-                    sherpa_onnx::write(&context.to_string_lossy(), &history.context(&speech), SAMPLE_RATE);
-                    eprintln!("  (saved {}: {text:?})", heard.display());
-                }
-                if let Some(text) = clean_transcript(&text) {
-                    on_heard(text);
-                }
             }
+            if let Some(span) = turn.take_if_done(history.end(), self.vad.detected(), turn_gap) {
+                finish(span, &history, &mut saved);
+            }
+        }
+        // input ended (tests): whatever was being said is a turn
+        self.vad.flush();
+        while let Some(segment) = self.vad.front() {
+            turn.add_segment(segment.start(), segment.n() as i64);
+            self.vad.pop();
+        }
+        if let Some(span) = turn.take_if_done(i64::MAX, false, 0) {
+            finish(span, &history, &mut saved);
         }
     }
 
@@ -262,22 +379,23 @@ impl Ears {
     }
 }
 
-/// Audio before a VAD segment, prepended so soft first words survive.
+/// Audio before the first segment of a turn, so soft first words survive
+/// (the VAD fires a little after the "t" of "talk" begins).
 const PREROLL: i64 = SAMPLE_RATE as i64 * 4 / 10; // 400 ms
-/// Lead-in saved next to each utterance in debug mode.
+/// Lead-in saved next to each turn in debug mode.
 const CONTEXT: i64 = SAMPLE_RATE as i64 * 2;
-/// How much recent audio to keep.
-const HISTORY: usize = SAMPLE_RATE as usize * 10;
+/// How much recent audio to keep (also the longest possible turn).
+const HISTORY: usize = SAMPLE_RATE as usize * 60;
+/// A turn this long is transcribed even if speech continues.
+const MAX_TURN: i64 = SAMPLE_RATE as i64 * 45;
 
-/// The last few seconds fed to the VAD, indexed like the VAD's own sample
-/// positions (counted from the last reset).
+/// Recent audio fed to the VAD, indexed like the VAD's own sample positions
+/// (counted from the last reset).
 #[derive(Default)]
 struct History {
     samples: Vec<f32>,
     /// VAD position of `samples[0]`.
     first: i64,
-    /// VAD position where the previous utterance ended (never prepend into it).
-    last_end: i64,
 }
 
 impl History {
@@ -290,36 +408,48 @@ impl History {
         }
     }
 
+    /// VAD position just after the newest sample.
+    fn end(&self) -> i64 {
+        self.first + self.samples.len() as i64
+    }
+
     fn slice(&self, from: i64, to: i64) -> &[f32] {
-        let end = (self.first + self.samples.len() as i64).min(to).max(self.first);
+        let end = self.end().min(to).max(self.first);
         let from = from.max(self.first).min(end);
         &self.samples[(from - self.first) as usize..(end - self.first) as usize]
     }
-
-    /// `segment` (starting at VAD position `start`) with up to PREROLL of the
-    /// audio before it, not reaching back into the previous utterance.
-    fn with_preroll(&mut self, start: i64, segment: &[f32]) -> Vec<f32> {
-        let from = (start - PREROLL).max(self.last_end);
-        let mut out = self.slice(from, start).to_vec();
-        out.extend_from_slice(segment);
-        self.last_end = start + segment.len() as i64;
-        out
-    }
-
-    /// Up to CONTEXT of audio before `utterance` (which ends at `last_end`).
-    fn context(&self, utterance: &[f32]) -> Vec<f32> {
-        let start = self.last_end - utterance.len() as i64;
-        self.slice(start - CONTEXT, self.last_end).to_vec()
-    }
 }
 
-fn open_mic() -> Result<Microphone> {
-    Ok(MicrophoneBuilder::new()
-        .default_device()?
-        .default_config()?
-        .prefer_channel_counts([1.try_into().unwrap()])
-        .prefer_sample_rates([16_000.try_into().unwrap()])
-        .open_stream()?)
+/// Gathers VAD segments into one turn: from PREROLL before the first segment
+/// (never reaching into the previous turn) to the end of the last one.
+#[derive(Default)]
+struct Turn {
+    span: Option<(i64, i64)>,
+    last_end: i64,
+}
+
+impl Turn {
+    fn add_segment(&mut self, start: i64, len: i64) {
+        let end = start + len;
+        match &mut self.span {
+            Some((_, e)) => *e = (*e).max(end),
+            None => self.span = Some(((start - PREROLL).max(self.last_end), end)),
+        }
+    }
+
+    /// The finished turn, once nobody is speaking and `gap` samples have
+    /// passed since its speech ended (or it has grown too long).
+    fn take_if_done(&mut self, now: i64, speaking: bool, gap: i64) -> Option<(i64, i64)> {
+        let (start, end) = self.span?;
+        let quiet_long_enough = !speaking && now.saturating_sub(end) >= gap;
+        if quiet_long_enough || end - start >= MAX_TURN {
+            self.span = None;
+            self.last_end = end;
+            Some((start, end))
+        } else {
+            None
+        }
+    }
 }
 
 /// Drop Whisper's non-speech markers ("[BLANK_AUDIO]", "(wind blowing)") and
@@ -357,7 +487,9 @@ mod tests {
         let quiet = |v: &[f32]| v.iter().map(|x| x * 0.08).collect::<Vec<f32>>();
         let (a, b) = (quiet(&a), quiet(&b));
 
-        for (pause_ms, expected) in [(400u32, 1usize), (1500, 2)] {
+        // a turn ends after 1.2 s of silence: shorter thinking pauses stay in one turn
+        let gap = (1.2 * SAMPLE_RATE as f64) as i64;
+        for (pause_ms, expected) in [(400u32, 1usize), (900, 1), (1800, 2)] {
             let mut audio = vec![0.0; rate as usize / 2];
             audio.extend(&a);
             audio.extend(vec![0.0; (rate * pause_ms / 1000) as usize]);
@@ -370,7 +502,7 @@ mod tests {
             }
             drop(tx);
             let heard = std::cell::RefCell::new(Vec::new());
-            ears.transcribe_loop(rx, &|t| heard.borrow_mut().push(t), None);
+            ears.transcribe_loop(rx, &|t| heard.borrow_mut().push(t), gap, None);
             let heard = heard.into_inner();
             println!("pause {pause_ms} ms -> {heard:?}");
             assert_eq!(heard.len(), expected, "{heard:?}");
@@ -413,20 +545,25 @@ mod tests {
     }
 
     #[test]
-    fn preroll_reaches_back_but_not_into_previous_utterance() {
-        let mut h = History::default();
-        let audio: Vec<f32> = (0..SAMPLE_RATE * 2).map(|i| i as f32).collect();
-        h.push(&audio);
-        // first utterance at 1.0 s: gets 400 ms before it
-        let seg = &audio[16_000..17_000];
-        let out = h.with_preroll(16_000, seg);
-        assert_eq!(out.len(), PREROLL as usize + 1000);
-        assert_eq!(out[0], (16_000 - PREROLL) as f32);
-        // next utterance 100 ms after the first ended: only that gap is prepended
-        let seg = &audio[18_600..19_000];
-        let out = h.with_preroll(18_600, seg);
-        assert_eq!(out[0], 17_000.0);
-        assert_eq!(out.len(), 1600 + 400);
+    fn turn_joins_segments_until_a_long_silence() {
+        let sec = SAMPLE_RATE as i64;
+        let mut t = Turn::default();
+        t.add_segment(2 * sec, sec); // speech 2.0-3.0 s
+        assert_eq!(t.take_if_done(3 * sec + sec / 2, false, sec), None); // 0.5 s quiet: wait
+        t.add_segment(3 * sec + sec / 2, sec); // speech again 3.5-4.5 s
+        assert_eq!(t.take_if_done(5 * sec, true, sec), None); // still speaking
+        assert_eq!(t.take_if_done(5 * sec + sec / 2, false, sec), Some((2 * sec - PREROLL, 4 * sec + sec / 2)));
+        assert_eq!(t.take_if_done(9 * sec, false, sec), None); // nothing pending
+        // next turn starts 0.1 s after the last: preroll stops at the previous end
+        t.add_segment(4 * sec + sec / 2 + sec / 10, sec);
+        assert_eq!(t.take_if_done(20 * sec, false, sec).unwrap().0, 4 * sec + sec / 2);
+    }
+
+    #[test]
+    fn overlong_turn_is_cut() {
+        let mut t = Turn::default();
+        t.add_segment(PREROLL, MAX_TURN);
+        assert_eq!(t.take_if_done(MAX_TURN, true, i64::MAX), Some((0, PREROLL + MAX_TURN)));
     }
 
     #[test]

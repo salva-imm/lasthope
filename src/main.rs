@@ -26,13 +26,15 @@ use crate::persona::Persona;
 use crate::speech_out::{Mouth, Voice};
 
 const USAGE: &str = "\
-usage: lasthope [--text]
+usage: lasthope [--text | --mics]
 
   --text   type instead of speaking: stdin replaces the mic, stdout the speaker
            (no speech models are loaded)
+  --mics   list microphones and show which one she will listen through
 
 settings (environment or .env): LLM_BASE_URL, LLM_API_KEY, LLM_MODEL
 optional: LLM_TEMPERATURE (0.8), PERSONA_PATH (./persona.md),
+          MIC_DEVICE (part of a mic name, or \"default\"), END_OF_TURN_MS (1200),
           KOKORO_DIR (./kokoro-multi-lang-v1_0), MODELS_DIR (./models)
 
 spoken commands: \"close the rite\" / \"end the session\" ends the session,
@@ -43,6 +45,11 @@ async fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.iter().any(|a| a == "-h" || a == "--help") {
         println!("{USAGE}\n\n{}", text_io::COMMANDS_HELP);
+        return Ok(());
+    }
+    if args.iter().any(|a| a == "--mics") {
+        let pref = std::env::var("MIC_DEVICE").ok().filter(|v| !v.is_empty());
+        println!("{}", audio_in::describe_mics(pref.as_deref())?);
         return Ok(());
     }
     if let Some(bad) = args.iter().find(|a| *a != "--text") {

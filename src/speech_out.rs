@@ -23,6 +23,8 @@ use crate::config::Config;
 /// Kokoro speaker id (2 = the voice used so far) and pace.
 const VOICE_ID: i32 = 2;
 const SPEED: f32 = 1.0;
+/// Silence before each reply (see `speak`).
+const LEAD_IN_MS: usize = 200;
 
 /// Words the phonemizer would get wrong, rewritten before phonemizing.
 const PRONUNCIATIONS: &[(&str, &str)] = &[("lasthope", "Last Hope")];
@@ -148,6 +150,13 @@ impl Engine {
         let mut sink = DeviceSinkBuilder::open_default_sink().context("opening the speaker")?;
         sink.log_on_drop(false);
         let player = Player::connect_new(sink.mixer());
+        // Bluetooth headphones often swallow the first moments of a new stream;
+        // let that be silence rather than her first syllable.
+        player.append(SamplesBuffer::new(
+            1.try_into().unwrap(),
+            24_000.try_into().unwrap(),
+            vec![0.0f32; 24_000 * LEAD_IN_MS / 1000],
+        ));
 
         for sentence in split_sentences(&for_speech(text)) {
             if cancel.load(Ordering::Relaxed) {

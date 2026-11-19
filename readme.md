@@ -21,6 +21,15 @@ no C++ toolchain setup and no dylib to manage: `cargo build` is enough.
 The microphone is only open while she is listening. It is closed while she thinks or
 speaks, so she never hears herself.
 
+Your turn ends after 1.2 s of silence (`END_OF_TURN_MS`); shorter thinking pauses stay
+in the same turn, and the whole turn is transcribed at once.
+
+**Bluetooth headphones:** while a Bluetooth headset's own mic is open, macOS switches it
+to phone-call quality (16 kHz, both directions), which makes her sound like a phone call,
+causes dropouts each time the mic opens or closes, and hurts recognition. So by default
+she listens through another mic (e.g. the MacBook's) when the default mic belongs to your
+headphones. `lasthope --mics` shows the choice; `MIC_DEVICE` overrides it.
+
 ### Code layout
 
 ```
@@ -58,13 +67,15 @@ sends `Command`s and watches `Event`s:
    LLM_MODEL=...        # check your provider's current model list
    ```
    Real environment variables override `.env`. To switch providers, change these three.
-   Optional: `LLM_TEMPERATURE` (default 0.8), `PERSONA_PATH` (default `./persona.md`).
+   Optional: `LLM_TEMPERATURE` (default 0.8), `PERSONA_PATH` (default `./persona.md`),
+   `MIC_DEVICE`, `END_OF_TURN_MS` (see `.env.example`).
 
 ## Run
 
 ```bash
 cargo run --release            # voice: speak into the mic
 cargo run --release -- --text  # type instead: stdin replaces the mic, stdout the speaker
+cargo run --release -- --mics  # list microphones and show which one she will use
 ```
 
 `--text` loads no speech models, so it starts instantly and works without audio hardware.

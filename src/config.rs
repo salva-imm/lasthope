@@ -25,6 +25,10 @@ pub struct Config {
     pub persona_path: PathBuf,
     /// Sampling temperature (variety of her replies).
     pub temperature: f32,
+    /// Microphone name (substring) or "default"; unset avoids a headset's mic.
+    pub mic_device: Option<String>,
+    /// Silence that ends my turn.
+    pub end_of_turn: std::time::Duration,
 }
 
 impl Config {
@@ -64,6 +68,16 @@ impl Config {
                     .ok()
                     .filter(|t: &f32| (0.0..=2.0).contains(t))
                     .ok_or_else(|| anyhow::anyhow!("LLM_TEMPERATURE must be a number from 0 to 2, got {t:?}"))?,
+            },
+            mic_device: get("MIC_DEVICE"),
+            end_of_turn: match get("END_OF_TURN_MS") {
+                None => std::time::Duration::from_millis(1200),
+                Some(ms) => ms
+                    .parse()
+                    .ok()
+                    .filter(|ms: &u64| (300..=5000).contains(ms))
+                    .map(std::time::Duration::from_millis)
+                    .ok_or_else(|| anyhow::anyhow!("END_OF_TURN_MS must be 300 to 5000, got {ms:?}"))?,
             },
         })
     }
