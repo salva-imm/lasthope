@@ -194,36 +194,44 @@ impl Ears {
         debug_dir: Option<PathBuf>,
     ) {
         let mut resampler: Option<(u32, LinearResampler)> = None;
+        let mut history = History::default();
         let mut saved = 0u32;
         for chunk in rx {
             let (samples, rate) = match chunk {
                 Chunk::Audio { samples, rate } => (samples, rate),
                 Chunk::Closed => {
                     self.vad.reset();
+                    history = History::default();
                     if let Some((_, r)) = &resampler {
                         r.reset();
                     }
                     continue;
                 }
             };
-            if rate as i32 == SAMPLE_RATE {
-                self.vad.accept_waveform(&samples);
+            let samples = if rate as i32 == SAMPLE_RATE {
+                samples
             } else {
                 if resampler.as_ref().is_none_or(|(r, _)| *r != rate) {
                     resampler = LinearResampler::create(rate as i32, SAMPLE_RATE).map(|r| (rate, r));
                 }
                 match &resampler {
-                    Some((_, r)) => self.vad.accept_waveform(&r.resample(&samples, false)),
+                    Some((_, r)) => r.resample(&samples, false),
                     None => {
                         eprintln!("  ! cannot resample {rate} Hz audio");
                         continue;
                     }
                 }
-            }
+            };
+            self.vad.accept_waveform(&samples);
+            history.push(&samples);
+
             while let Some(segment) = self.vad.front() {
-                let speech = segment.samples();
+                // The VAD fires a little after a soft first word begins ("t" of
+                // "talk"); give Whisper the audio just before it too.
+                let speech = history.with_preroll(segment.start(), segment.samples());
+                self.vad.pop();
                 let started = Instant::now();
-                let text = self.transcribe(speech);
+                let text = self.transcribe(&speech);
                 eprintln!(
                     "  ({:.1}s of speech, transcribed in {} ms)",
                     speech.len() as f32 / SAMPLE_RATE as f32,
@@ -231,13 +239,13 @@ impl Ears {
                 );
                 if let Some(dir) = &debug_dir {
                     saved += 1;
-                    let path = dir.join(format!("heard-{saved:03}.wav"));
                     let _ = std::fs::create_dir_all(dir);
-                    if sherpa_onnx::write(&path.to_string_lossy(), speech, SAMPLE_RATE) {
-                        eprintln!("  (saved {}: {text:?})", path.display());
-                    }
+                    let heard = dir.join(format!("heard-{saved:03}.wav"));
+                    let context = dir.join(format!("context-{saved:03}.wav"));
+                    sherpa_onnx::write(&heard.to_string_lossy(), &speech, SAMPLE_RATE);
+                    sherpa_onnx::write(&context.to_string_lossy(), &history.context(&speech), SAMPLE_RATE);
+                    eprintln!("  (saved {}: {text:?})", heard.display());
                 }
-                self.vad.pop();
                 if let Some(text) = clean_transcript(&text) {
                     on_heard(text);
                 }
@@ -251,6 +259,57 @@ impl Ears {
         stream.accept_waveform(SAMPLE_RATE, samples);
         self.asr.decode(&stream);
         stream.get_result().map(|r| r.text).unwrap_or_default()
+    }
+}
+
+/// Audio before a VAD segment, prepended so soft first words survive.
+const PREROLL: i64 = SAMPLE_RATE as i64 * 4 / 10; // 400 ms
+/// Lead-in saved next to each utterance in debug mode.
+const CONTEXT: i64 = SAMPLE_RATE as i64 * 2;
+/// How much recent audio to keep.
+const HISTORY: usize = SAMPLE_RATE as usize * 10;
+
+/// The last few seconds fed to the VAD, indexed like the VAD's own sample
+/// positions (counted from the last reset).
+#[derive(Default)]
+struct History {
+    samples: Vec<f32>,
+    /// VAD position of `samples[0]`.
+    first: i64,
+    /// VAD position where the previous utterance ended (never prepend into it).
+    last_end: i64,
+}
+
+impl History {
+    fn push(&mut self, samples: &[f32]) {
+        self.samples.extend_from_slice(samples);
+        if self.samples.len() > 2 * HISTORY {
+            let drop = self.samples.len() - HISTORY;
+            self.samples.drain(..drop);
+            self.first += drop as i64;
+        }
+    }
+
+    fn slice(&self, from: i64, to: i64) -> &[f32] {
+        let end = (self.first + self.samples.len() as i64).min(to).max(self.first);
+        let from = from.max(self.first).min(end);
+        &self.samples[(from - self.first) as usize..(end - self.first) as usize]
+    }
+
+    /// `segment` (starting at VAD position `start`) with up to PREROLL of the
+    /// audio before it, not reaching back into the previous utterance.
+    fn with_preroll(&mut self, start: i64, segment: &[f32]) -> Vec<f32> {
+        let from = (start - PREROLL).max(self.last_end);
+        let mut out = self.slice(from, start).to_vec();
+        out.extend_from_slice(segment);
+        self.last_end = start + segment.len() as i64;
+        out
+    }
+
+    /// Up to CONTEXT of audio before `utterance` (which ends at `last_end`).
+    fn context(&self, utterance: &[f32]) -> Vec<f32> {
+        let start = self.last_end - utterance.len() as i64;
+        self.slice(start - CONTEXT, self.last_end).to_vec()
     }
 }
 
@@ -294,6 +353,9 @@ mod tests {
         let ears = Ears::load(Path::new("./models")).unwrap();
         let (a, rate) = voice.synth("Talk to me.").unwrap().unwrap();
         let (b, _) = voice.synth("Tell me something about Rust and the EVM.").unwrap().unwrap();
+        // Real mic level: the user's recordings peak around 0.04-0.08 RMS, Kokoro ~0.6.
+        let quiet = |v: &[f32]| v.iter().map(|x| x * 0.08).collect::<Vec<f32>>();
+        let (a, b) = (quiet(&a), quiet(&b));
 
         for (pause_ms, expected) in [(400u32, 1usize), (1500, 2)] {
             let mut audio = vec![0.0; rate as usize / 2];
@@ -317,6 +379,68 @@ mod tests {
             assert!(all.contains("rust") && all.contains("evm"), "{all}");
             ears.vad.reset();
         }
+    }
+
+    /// Diagnostic: how late does the VAD open a segment on real recordings?
+    /// `cargo test --release vad_onset_lag -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn vad_onset_lag() {
+        let ears = Ears::load(Path::new("./models")).unwrap();
+        let mut files: Vec<_> = std::fs::read_dir("debug-audio").unwrap().flatten().map(|e| e.path()).collect();
+        files.sort();
+        for f in files {
+            let wave = sherpa_onnx::Wave::read(&f.to_string_lossy()).unwrap();
+            let speech = wave.samples();
+            let lead = SAMPLE_RATE as usize; // 1 s of silence before
+            let onset = lead + speech.iter().position(|x| x.abs() > 0.01).unwrap_or(0);
+            let mut audio = vec![0.0f32; lead];
+            audio.extend_from_slice(speech);
+            audio.extend(vec![0.0f32; SAMPLE_RATE as usize]);
+            ears.vad.reset();
+            for c in audio.chunks(800) {
+                ears.vad.accept_waveform(c);
+            }
+            ears.vad.flush();
+            if let Some(seg) = ears.vad.front() {
+                let lag_ms = (seg.start() - onset as i64) * 1000 / SAMPLE_RATE as i64;
+                println!("{}: segment opens {lag_ms:+} ms vs first sound", f.display());
+            }
+            while ears.vad.front().is_some() {
+                ears.vad.pop();
+            }
+        }
+    }
+
+    #[test]
+    fn preroll_reaches_back_but_not_into_previous_utterance() {
+        let mut h = History::default();
+        let audio: Vec<f32> = (0..SAMPLE_RATE * 2).map(|i| i as f32).collect();
+        h.push(&audio);
+        // first utterance at 1.0 s: gets 400 ms before it
+        let seg = &audio[16_000..17_000];
+        let out = h.with_preroll(16_000, seg);
+        assert_eq!(out.len(), PREROLL as usize + 1000);
+        assert_eq!(out[0], (16_000 - PREROLL) as f32);
+        // next utterance 100 ms after the first ended: only that gap is prepended
+        let seg = &audio[18_600..19_000];
+        let out = h.with_preroll(18_600, seg);
+        assert_eq!(out[0], 17_000.0);
+        assert_eq!(out.len(), 1600 + 400);
+    }
+
+    #[test]
+    fn history_trims_and_keeps_positions() {
+        let mut h = History::default();
+        let chunk = vec![1.0f32; HISTORY];
+        h.push(&chunk);
+        h.push(&chunk);
+        h.push(&[2.0; 10]);
+        assert_eq!(h.samples.len(), HISTORY);
+        assert_eq!(h.first, (2 * HISTORY + 10 - HISTORY) as i64);
+        let end = (2 * HISTORY + 10) as i64;
+        assert_eq!(h.slice(end - 10, end), &[2.0; 10]);
+        assert!(h.slice(0, 5).is_empty()); // trimmed away
     }
 
     #[test]
