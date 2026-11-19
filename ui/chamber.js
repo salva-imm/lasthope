@@ -56,6 +56,15 @@
     $('length').disabled = vigil.running;
   }
 
+  function drawReading(r) {
+    $('reading-card').hidden = !r;
+    if (!r) return;
+    $('reading-where').textContent = `${r.title} · page ${r.page} of ${r.pages}`;
+    $('reading-question').textContent = r.question
+      ? `${r.again ? 'Asked again: ' : ''}${r.question}`
+      : 'She reads the page with you.';
+  }
+
   function word(speaker, text) {
     return el('div', { class: `word ${speaker}` },
       el('span', { class: 'who' }, speaker === 'her' ? 'Her' : 'You'), el('span', {}, text));
@@ -161,6 +170,7 @@
     lastHer = hers.length ? hers[hers.length - 1].text : '';
     drawState();
     drawVigil();
+    drawReading(snap.live.reading);
     drawWords(snap.transcript);
     drawMemory();
   }
@@ -189,6 +199,8 @@
         case 'memory_changed':
         case 'lagged':
           later(); break;
+        case 'reading_changed':
+          drawReading(e.reading); break;
         case 'notice':
           whisper(e.text); break;
         case 'error':

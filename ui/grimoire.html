@@ -1,0 +1,105 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#070506">
+<title>Lasthope · Grimoire</title>
+<link rel="stylesheet" href="app.css">
+</head>
+<body class="grimoire">
+<div class="page">
+
+<header class="top">
+  <div class="top-row">
+    <div class="brand-row">
+      <span class="brand">LASTHOPE</span>
+      <nav class="nav" aria-label="Sections">
+        <a href="/">Chamber</a>
+        <a href="/grimoire" aria-current="page">Grimoire</a>
+        <a href="/archive">Archive</a>
+      </nav>
+    </div>
+    <span class="meta"><span id="dir">The shelf</span> <span class="conn" id="conn" hidden>· Lost: reconnecting</span></span>
+  </div>
+  <div class="checker" aria-hidden="true"></div>
+</header>
+
+<div class="columns">
+
+<main class="main">
+
+  <section class="card account leaf" aria-labelledby="leaf-h">
+    <div class="row-between">
+      <h1 class="night-title book-title" id="leaf-h">The grimoire</h1>
+      <div class="meta" id="leaf-meta"></div>
+    </div>
+    <div class="pager" id="pager" hidden>
+      <button type="button" class="btn" id="prev" aria-label="Previous page">‹ Back</button>
+      <label class="sr-only" for="page-no">Page</label>
+      <input id="page-no" type="number" min="1" inputmode="numeric">
+      <span class="muted small" id="page-of"></span>
+      <button type="button" class="btn" id="next" aria-label="Next page">Onward ›</button>
+    </div>
+    <div class="sheet" id="sheet">
+      <canvas id="canvas" hidden></canvas>
+      <p class="empty sheet-empty" id="sheet-empty">Choose a book from the shelf, or let her choose a page.</p>
+    </div>
+    <p class="script her-line" id="her-line" aria-live="polite" hidden></p>
+    <div class="whisper" id="whisper" role="status"></div>
+  </section>
+
+  <section class="card strong" aria-labelledby="question-h" id="question-card" hidden>
+    <div class="row-between">
+      <h2 class="h" id="question-h">Her question</h2>
+      <span class="small muted" id="question-tag"></span>
+    </div>
+    <p class="script oath" id="question"></p>
+    <form class="say" id="answer">
+      <label class="sr-only" for="answer-text">Your answer</label>
+      <input id="answer-text" autocomplete="off" placeholder="Answer aloud, or write it here…" maxlength="2000">
+      <button type="submit" class="btn primary">Answer</button>
+    </form>
+  </section>
+
+  <section class="card" aria-labelledby="read-h">
+    <h2 class="h" id="read-h">Read with her</h2>
+    <div class="pair">
+      <button type="button" class="btn primary" id="read-this" disabled>This page</button>
+      <button type="button" class="btn" id="read-next">The next unread</button>
+      <button type="button" class="btn" id="read-oath">For my oath</button>
+      <button type="button" class="btn" id="read-random">A random page</button>
+    </div>
+    <div class="row-between">
+      <p class="small muted" id="read-note" style="margin: 0">She explains the page in three sentences, then asks two questions.</p>
+      <button type="button" class="btn quiet small-text" id="leave" hidden>Leave the page</button>
+    </div>
+  </section>
+
+</main>
+
+<aside class="side">
+
+  <section class="card" aria-labelledby="shelf-h">
+    <div class="row-between">
+      <h2 class="h" id="shelf-h">The shelf</h2>
+      <button type="button" class="btn quiet small-text" id="reindex">Read the shelf again</button>
+    </div>
+    <div id="books" class="books"></div>
+  </section>
+
+  <section class="card" aria-labelledby="asked-h">
+    <div class="row-between">
+      <h2 class="h" id="asked-h">Questions asked</h2>
+      <span class="small muted" id="tally"></span>
+    </div>
+    <div id="asked" class="asked"></div>
+  </section>
+
+</aside>
+</div>
+</div>
+<script src="common.js"></script>
+<script type="module" src="grimoire.js"></script>
+</body>
+</html>

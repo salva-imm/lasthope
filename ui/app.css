@@ -1,4 +1,4 @@
-/* Lasthope: the chamber and the archive. Values follow the design mockups. */
+/* Lasthope: the chamber, the grimoire and the archive. Values follow the design mockups. */
 
 @font-face { font-family: 'Cinzel'; font-weight: 400 900; font-display: swap; src: url(fonts/cinzel-latin.woff2) format('woff2'); }
 @font-face { font-family: 'JetBrains Mono'; font-weight: 100 800; font-display: swap; src: url(fonts/jetbrains-mono-latin.woff2) format('woff2'); }
@@ -188,6 +188,32 @@ button:disabled { cursor: default; opacity: .45; }
 .pair-cards { display: flex; flex-wrap: wrap; gap: 24px; }
 .pair-cards .card { flex: 1 1 260px; gap: 10px; }
 
+/* --- the grimoire --- */
+.grimoire .side { flex: 1 1 320px; gap: 22px; }
+.grimoire .main { gap: 24px; }
+.book-title { font-size: clamp(22px, 5vw, 30px); letter-spacing: .08em; overflow-wrap: anywhere; }
+.pager { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
+.pager input { width: 84px; min-height: 44px; padding: 0 10px; background: var(--night); border: 1px solid var(--line); }
+.sheet { position: relative; min-height: 220px; border: 1px solid var(--line); background: var(--night); }
+.sheet canvas { display: block; }
+.sheet-empty { margin: 0; padding: 48px 20px; text-align: center; }
+.her-line { font-size: 20px; line-height: 1.32; font-style: italic; }
+.books { display: flex; flex-direction: column; gap: 14px; }
+.book-row { display: flex; flex-direction: column; gap: 6px; }
+.book-row > .btn { align-self: flex-start; }
+.night.book { width: 100%; min-height: 60px; }
+.night.book.unread .book-name { color: var(--ash); }
+.book-name { font-family: var(--title); font-weight: 700; font-size: 16px; letter-spacing: .08em; line-height: 1.2; overflow-wrap: anywhere; }
+.book-current { padding-left: 2px; color: var(--gold); }
+.asked { display: flex; flex-direction: column; gap: 16px; max-height: 640px; overflow-y: auto; }
+.q { display: flex; flex-direction: column; gap: 4px; padding-bottom: 14px; border-bottom: 1px solid var(--line); }
+.q p { overflow-wrap: anywhere; }
+.q-where { font-size: 11px; letter-spacing: .1em; text-transform: uppercase; }
+.verdict { letter-spacing: .08em; }
+.verdict.right { color: var(--gold); }
+.verdict.wrong { color: var(--blood); }
+.reading-card .script { font-size: 20px; line-height: 1.3; }
+
 @keyframes lh-spin { to { transform: rotate(360deg); } }
 @keyframes lh-spin-back { to { transform: rotate(-360deg); } }
 @keyframes lh-breathe { 0%, 100% { opacity: .45; } 50% { opacity: 1; } }
@@ -196,6 +222,7 @@ button:disabled { cursor: default; opacity: .45; }
   body { padding: 20px 16px 48px; }
   .altar { padding: 28px 12px; }
   .account { padding: 22px 16px; }
+  .nav { gap: 16px; letter-spacing: .16em; }
   .brand { font-size: 22px; letter-spacing: .24em; }
 }
 

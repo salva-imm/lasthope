@@ -20,3 +20,6 @@ serde_json = "1.0.154"
 anyhow = "1.0.104"
 # memory: SQLite (bundled, compiled with cc; no macros, no compile-time DB)
 sqlx = { version = "0.9.1", default-features = false, features = ["runtime-tokio", "sqlite-bundled"] }
+# the grimoire: page text out of PDFs (pure Rust, on lopdf) and file hashes
+pdf-extract = "0.12.1"
+sha2 = "0.11.1"

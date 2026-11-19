@@ -9,6 +9,7 @@
 //! - facts: what she has learned about me, each deletable
 //! - state: the mission and the streak
 //! - settings: small key/value preferences (her voice and pace, the UI key)
+//! - books, pages, questions: the grimoire (see grimoire.rs)
 //!
 //! "Today" is my local day with a 4 am boundary: a session at 00:30 still
 //! belongs to the evening before.
@@ -182,7 +183,7 @@ pub struct Focus {
 
 #[derive(Clone)]
 pub struct Memory {
-    pool: SqlitePool,
+    pub(crate) pool: SqlitePool,
 }
 
 impl Memory {
@@ -199,6 +200,7 @@ impl Memory {
             .await
             .with_context(|| format!("opening {}", path.display()))?;
         sqlx::raw_sql(SCHEMA).execute(&pool).await.context("creating the schema")?;
+        sqlx::raw_sql(crate::grimoire::SCHEMA).execute(&pool).await.context("creating the grimoire")?;
         sqlx::query("INSERT OR IGNORE INTO state (id, mission) VALUES (1, ?1)")
             .bind(DEFAULT_MISSION)
             .execute(&pool)
@@ -592,7 +594,7 @@ fn normalize_fact(s: &str) -> String {
 
 /// Turn free text into a safe FTS5 query: the meaningful words, each quoted,
 /// joined with OR (bm25 ranks lines matching more of them first).
-fn fts_query(text: &str) -> Option<String> {
+pub(crate) fn fts_query(text: &str) -> Option<String> {
     const STOP: &[&str] = &[
         "the", "and", "for", "you", "are", "was", "not", "but", "how", "can", "did", "has", "had",
         "her", "his", "she", "him", "its", "our", "out", "who", "why", "all", "any", "yes",

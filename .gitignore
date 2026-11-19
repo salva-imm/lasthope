@@ -23,3 +23,6 @@
 
 # the seal artwork (yours; the UI falls back to a dark circle)
 /ui/assets/
+
+# the grimoire: your PDFs (never in git)
+/books/

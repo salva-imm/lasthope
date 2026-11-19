@@ -95,6 +95,11 @@ impl Rite {
         matches!(self.phase, Phase::Open | Phase::AwaitingVerdict { .. })
     }
 
+    /// Plain conversation: no verdict or oath is being asked for.
+    pub fn is_open(&self) -> bool {
+        self.phase == Phase::Open
+    }
+
     /// The rite is closing: nothing more is said but the seal.
     pub fn closing(&self) -> bool {
         self.phase == Phase::Closing

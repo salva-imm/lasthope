@@ -4,7 +4,7 @@ A personal voice companion written in Rust. You speak, she listens, thinks and a
 Hearing and speaking run locally; only the language model call goes to the cloud.
 
 > All five phases are built: the foundation, her character and conversation, memory and
-> sessions, the vigil, and the web UI. Still to come: an LLM fallback chain, all-day
+> sessions, the vigil, and the web UI; plus the grimoire, reading your PDFs with her. Still to come: an LLM fallback chain, all-day
 > listening, and answering only your voice.
 
 ## How it works
@@ -46,12 +46,14 @@ src/
   streak.rs      days and the chain of seals (pure logic)
   memory.rs      SQLite: sessions, messages (+ full-text search), facts, mission, streak
   timer.rs       the vigil (focus timer) and the spoken words for it
+  grimoire.rs    the books: PDF indexing, choosing a page, the lesson and judging prompts
   text_io.rs     stdin/stdout mode, slash-commands, event printer
   web.rs         the web UI server: files, JSON API, WebSocket, who may come in
 ui/
-  index.html     the Chamber        archive.html   the Archive
+  index.html     the Chamber   grimoire.html  the Grimoire   archive.html  the Archive
   app.css        the look (colours, fonts, the seal's motion)
-  common.js      connection and helpers; chamber.js, archive.js: the two pages
+  common.js      connection and helpers; chamber.js, grimoire.js, archive.js: the pages
+  pdfjs/         pdf.js 6.5.438 (Mozilla, Apache-2.0), served from this machine
   fonts/         Cinzel, IM Fell English, JetBrains Mono (SIL OFL, see OFL.txt)
   assets/        seal.png, your artwork (gitignored; a dark circle stands in without it)
 ```
@@ -62,9 +64,11 @@ sends `Command`s and watches `Event`s:
 - Commands: `mute`, `stop_speaking`, `sleep`, `end_session`, `open_rite`, `oath_verdict`,
   `set_mission`, `forget_fact`, `timer_start` (optional `minutes`), `timer_pause`, `timer_reset`,
   `log_vigil` (`minutes`, optional `yesterday`), `set_voice` (`voice`, `pace`), `set_speaks_first`,
-  `read_aloud` (`session`), `burn_session` (`session`)
+  `read_aloud` (`session`), `burn_session` (`session`), `read` (`from`: `next`, `oath`,
+  `random`), `read_page` (`book`, `page`), `leave_page`, `set_book` (`book`), `reindex`
 - Events: `session_started`, `state_changed`, `user_spoke`, `she_spoke`, `timer_tick`,
-  `memory_changed`, `notice`, `error`, `session_ended`, `goodbye`
+  `memory_changed`, `notice`, `error`, `session_ended`, `reading_changed`, `shelf_changed`,
+  `goodbye`
 
 ## Setup
 
@@ -82,7 +86,7 @@ sends `Command`s and watches `Event`s:
    ```
    Real environment variables override `.env`. To switch providers, change these three.
    Optional: `LLM_TEMPERATURE` (default 0.8), `PERSONA_PATH` (default `./persona.md`),
-   `MIC_DEVICE`, `END_OF_TURN_MS` (see `.env.example`).
+   `MIC_DEVICE`, `END_OF_TURN_MS`, `BOOKS_DIR` (see `.env.example`).
 
 ## Run
 
@@ -109,6 +113,8 @@ These spoken phrases are commands instead:
 - **"close the rite"** or **"end the session"** (on its own): ends the session.
 - **"begin the vigil"** / **"pause the vigil"** / **"reset the vigil"** (on their own; "start",
   "resume", "hold", "timer" work too): see [The vigil](#the-vigil).
+- **"read the next page"** / **"read a random page"** / **"read a page for my oath"** /
+  **"leave the page"**: see [The grimoire](#the-grimoire).
 - **"please say …"** (or "please generate …", "please store …"): the rest is
   spoken into `output.wav` instead of being answered (voice mode only).
 
@@ -176,6 +182,36 @@ vigil resumes where it stopped.
   `/vigil yesterday 40` do the same by command.
 - She knows today's total and the running vigil, so she can hold you to the mission.
 
+### The grimoire
+
+Point `BOOKS_DIR` at a folder of PDFs (default `./books`, gitignored). She reads them with
+you, one page at a time.
+
+- **Indexing**: at startup, and whenever you press *Read the shelf again* in the Grimoire (or
+  type `/reindex`), every PDF in the folder (and its subfolders) is hashed. Only new or
+  changed files are read; each page's text goes into SQLite (`books`, `pages`, with FTS5
+  over the text). A book with no text to extract (a scan) is flagged, not an error; a file
+  that will not open is marked unreadable; a file that left the folder is marked gone, and
+  its pages are kept so old questions on it can still be judged. Your place in each book
+  (the last page read) is kept.
+- **Choosing a page**: always the Rust code, never the model. By default the next unread
+  page of the book you read (pages with too little text, like titles and figures, are
+  skipped); on request the page that best matches your oath (full-text search over every
+  book; the newest oath for today or tomorrow, or the great work if none is sworn; a page
+  taught in the last 14 days is passed over if another matches); a random page; or the page
+  you are looking at in the Grimoire. The next unread page and a page you chose move your
+  place; the oath and random pages do not.
+- **The lesson**: the Grimoire shows the real page (pdf.js, served locally). The model gets
+  only that page's text, explains its core idea in three spoken sentences, then asks two
+  questions, one at a time. Your spoken (or typed) answer is judged against the page text.
+  Every question, your answer and whether it was right are stored (`questions`).
+- **Wrong answers come back**: at the start of a later session, once you have spoken and
+  she has answered, she asks again up to two old questions you got wrong (never ones asked
+  in the last twelve hours) and shows their pages. A question counts as learned once you
+  answer it right.
+- While a question waits, your words are taken as the answer; spoken commands still work,
+  and "leave the page" closes the book. Only PDFs for now (no EPUB).
+
 ### The web UI
 
 Open **http://localhost:7700** while she runs. Plain HTML, CSS and JavaScript served from
@@ -187,6 +223,12 @@ Open **http://localhost:7700** while she runs. Plain HTML, CSS and JavaScript se
   the great work (renamable), the seven seals of the chain, the due oath with Kept / Broken,
   what she knows of you (strike out a fact with two presses), and her nature: voice
   (Kokoro's English voices), pace of speech, whether she speaks first.
+- **Grimoire**: the shelf (each book with its pages and your place, scans and unreadable
+  files marked; *Read this book*; *Read the shelf again* after adding or changing PDFs), the
+  page viewer (back, onward, go to a page), *Read with her*: this page, the next unread, for
+  my oath, a random page; her question with a field to answer in writing, and every
+  question asked with your answer and her verdict. The Chamber shows a card while a book
+  is open.
 - **Archive**: every night (NOX I, II, …) with its account, what was sworn, what she learned
   and every word; full-text search over all of it; *Hear it spoken* (she reads the account
   aloud), *Copy it out*, and *Burn this night* (two presses: deletes its words and the facts
@@ -218,6 +260,10 @@ Type these in the terminal, in either mode:
 /search words                search everything ever said
 /end                         close the rite (asks tomorrow's oath; /end again skips it)
 /open                        open the next rite (while the web UI keeps her running)
+/read [next|oath|random]     read a page with her (the next unread page by default)
+/page BOOK PAGE              read the page you choose;  /leave  closes the book
+/books   /book N             the shelf; make book N the one you read
+/reindex                     look through BOOKS_DIR again for new and changed PDFs
 ```
 
 Ctrl-C closes the session (summary included); a second Ctrl-C quits at once.

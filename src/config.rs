@@ -35,6 +35,8 @@ pub struct Config {
     pub ui_bind: std::net::IpAddr,
     pub ui_port: u16,
     pub ui_dir: PathBuf,
+    /// The grimoire: a folder of PDFs.
+    pub books_dir: PathBuf,
 }
 
 impl Config {
@@ -87,6 +89,7 @@ impl Config {
                 Some(p) => p.parse().map_err(|_| anyhow::anyhow!("UI_PORT must be a port number, got {p:?}"))?,
             },
             ui_dir: get("UI_DIR").unwrap_or("./ui".into()).into(),
+            books_dir: get("BOOKS_DIR").unwrap_or("./books".into()).into(),
             db_path: get("DB_PATH").unwrap_or("./lasthope.db".into()).into(),
             end_of_turn: match get("END_OF_TURN_MS") {
                 None => std::time::Duration::from_millis(1200),

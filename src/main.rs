@@ -6,6 +6,7 @@
 mod audio_in;
 mod config;
 mod core_loop;
+mod grimoire;
 mod llm;
 mod memory;
 mod persona;
@@ -41,10 +42,13 @@ settings (environment or .env): LLM_BASE_URL, LLM_API_KEY, LLM_MODEL
 optional: LLM_TEMPERATURE (0.8), PERSONA_PATH (./persona.md), DB_PATH (./lasthope.db),
           MIC_DEVICE (part of a mic name, or \"default\"), END_OF_TURN_MS (1200),
           KOKORO_DIR (./kokoro-multi-lang-v1_0), MODELS_DIR (./models),
-          UI_BIND (127.0.0.1; 0.0.0.0 lets your phone in, with a key), UI_PORT (7700), UI_DIR (./ui)
+          UI_BIND (127.0.0.1; 0.0.0.0 lets your phone in, with a key), UI_PORT (7700), UI_DIR (./ui),
+          BOOKS_DIR (./books: the grimoire's PDFs)
 
 spoken commands: \"close the rite\" / \"end the session\" ends the session,
                  \"begin / pause / reset the vigil\" drives the focus timer,
+                 \"read the next page\" / \"a random page\" / \"read a page for my oath\" /
+                 \"leave the page\" opens and closes the grimoire,
                  \"please say …\" speaks the rest into output.wav";
 
 #[tokio::main]
@@ -119,7 +123,8 @@ async fn main() -> Result<()> {
     // the web UI; while it is up, closing the rite does not end the program
     let ui_up = want_ui && {
         let mode = if text_mode { "text" } else { "voice" };
-        match web::start(cfg.ui_bind, cfg.ui_port, cfg.ui_dir.clone(), handle.clone(), memory.clone(), mode).await {
+        let books = cfg.books_dir.clone();
+        match web::start(cfg.ui_bind, cfg.ui_port, cfg.ui_dir.clone(), handle.clone(), memory.clone(), mode, books).await {
             Ok(links) => {
                 for link in links {
                     eprintln!("chamber: {link}");
@@ -133,7 +138,7 @@ async fn main() -> Result<()> {
         }
     };
 
-    Core::new(llm, persona, memory, mouth, gate, pacer, handle, inputs).run(ui_up).await;
+    Core::new(llm, persona, memory, mouth, gate, pacer, handle, inputs, cfg.books_dir.clone()).run(ui_up).await;
     let _ = tokio::time::timeout(Duration::from_secs(1), printer).await;
     Ok(())
 }

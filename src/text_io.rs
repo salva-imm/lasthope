@@ -13,6 +13,7 @@ use anyhow::{Result, anyhow};
 use tokio::sync::{broadcast, oneshot};
 
 use crate::core_loop::{Command, CoreHandle, Event, Input, Pacer, State};
+use crate::grimoire::Pick;
 use crate::memory::{Memory, Speaker};
 use crate::speech_out::Mouth;
 
@@ -28,6 +29,10 @@ commands:
   /facts                  what she knows of you;  /forget N  strikes fact N out
   /mission [text]         show or rename the great work
   /search words           search everything ever said
+  /read [next|oath|random]   read a page with her (next unread page by default)
+  /page BOOK PAGE         read the page you choose;  /leave  closes the book
+  /books                  the shelf;  /book N  makes book N the one you read
+  /reindex                look through BOOKS_DIR again for new and changed PDFs
   /end                    close the rite (she asks tomorrow's oath; /end again skips it)
   /open                   open the next rite (when the web UI keeps her running)
   /help";
@@ -56,6 +61,7 @@ enum Query {
     Facts,
     Mission,
     Search(String),
+    Books,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -115,6 +121,24 @@ fn parse_command(line: &str) -> Option<Result<Typed, String>> {
         ("facts", "") => Ok(Typed::Query(Query::Facts)),
         ("search", "") => Err("usage: /search words".to_string()),
         ("search", q) => Ok(Typed::Query(Query::Search(q.to_string()))),
+        ("read", "" | "next") => cmd(Command::Read { from: Pick::Next }),
+        ("read", "oath") => cmd(Command::Read { from: Pick::Oath }),
+        ("read", "random") => cmd(Command::Read { from: Pick::Random }),
+        ("read", _) => Err("usage: /read [next|oath|random]".to_string()),
+        ("page", t) => {
+            let nums: Vec<Option<u32>> = t.split_whitespace().map(|n| n.parse().ok()).collect();
+            match nums.as_slice() {
+                [Some(book), Some(page)] => cmd(Command::ReadPage { book: i64::from(*book), page: *page }),
+                _ => Err("usage: /page BOOK PAGE   (book numbers from /books)".to_string()),
+            }
+        }
+        ("leave", "") => cmd(Command::LeavePage),
+        ("books", "") => Ok(Typed::Query(Query::Books)),
+        ("book", n) => match n.parse() {
+            Ok(book) => cmd(Command::SetBook { book }),
+            Err(_) => Err("usage: /book N   (numbers from /books)".to_string()),
+        },
+        ("reindex", "") => cmd(Command::Reindex),
         _ => Err(COMMANDS_HELP.to_string()),
     })
 }
@@ -146,6 +170,29 @@ async fn answer(memory: &Memory, query: Query) -> anyhow::Result<String> {
                 out += &format!("\noath for {} {}: {}", o.day.weekday(), o.day, o.text);
             }
             out
+        }
+        Query::Books => {
+            let books = memory.books().await?;
+            let current = memory.current_book().await?.map(|b| b.id);
+            if books.is_empty() {
+                return Ok("the shelf is empty (BOOKS_DIR, then /reindex)".into());
+            }
+            let mut out: Vec<String> = books
+                .iter()
+                .map(|b| {
+                    let state = match (b.status.as_str(), b.missing) {
+                        (_, true) => "gone from the folder".to_string(),
+                        ("ok", _) => format!("{} pages, read to page {}", b.pages, b.last_page),
+                        ("no_text", _) => format!("{} pages, no text (a scan?)", b.pages),
+                        _ => format!("unreadable: {}", b.error.as_deref().unwrap_or("?")),
+                    };
+                    let mark = if Some(b.id) == current { "*" } else { " " };
+                    format!(" {mark}{:>3}  {}  ({state})", b.id, b.title)
+                })
+                .collect();
+            let (answered, right) = memory.question_tally().await?;
+            out.push(format!("questions answered: {answered}, right: {right}"));
+            out.join("\n")
         }
         Query::Search(q) => {
             let hits = memory.search(&q, 10, None).await?;
@@ -217,6 +264,7 @@ pub fn spawn_stdin(
 pub async fn print_events(mut rx: broadcast::Receiver<Event>, echo_user: bool) {
     let mut last_running = None;
     let mut last_printed = None;
+    let mut last_page = None;
     loop {
         let event = match rx.recv().await {
             Ok(e) => e,
@@ -256,7 +304,17 @@ pub async fn print_events(mut rx: broadcast::Receiver<Event>, echo_user: bool) {
                 }
                 last_running = Some(running);
             }
-            Event::MemoryChanged => {}
+            Event::MemoryChanged | Event::ShelfChanged => {}
+            Event::ReadingChanged { reading } => {
+                let page = reading.map(|r| (r.title, r.page, r.pages));
+                if page != last_page {
+                    match &page {
+                        Some((title, n, of)) => eprintln!("  · the grimoire: {title}, page {n} of {of}"),
+                        None => eprintln!("  · the book is closed"),
+                    }
+                    last_page = page;
+                }
+            }
             Event::Notice { text } => eprintln!("  · {text}"),
             Event::Error { message } => eprintln!("  ! {message}"),
             Event::SessionEnded => eprintln!("  · the rite is closed"),
@@ -296,6 +354,11 @@ mod tests {
         assert!(matches!(parse_command("/forget x"), Some(Err(_))));
         assert!(matches!(parse_command("/nope"), Some(Err(_))));
         assert!(matches!(parse_command("/timer"), Some(Err(e)) if e.starts_with("usage: /timer")));
+        assert_eq!(parse_command("/read"), cmd(Command::Read { from: Pick::Next }));
+        assert_eq!(parse_command("/read oath"), cmd(Command::Read { from: Pick::Oath }));
+        assert_eq!(parse_command("/page 2 41"), cmd(Command::ReadPage { book: 2, page: 41 }));
+        assert!(matches!(parse_command("/page 2"), Some(Err(_))));
+        assert_eq!(parse_command("/book 3"), cmd(Command::SetBook { book: 3 }));
         assert_eq!(parse_command("talk to me"), None);
     }
 }

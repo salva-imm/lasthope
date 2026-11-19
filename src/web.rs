@@ -42,6 +42,8 @@ struct App {
     key: Option<String>,
     /// "voice" or "text"
     mode: &'static str,
+    /// The grimoire's PDFs.
+    books_dir: PathBuf,
 }
 
 /// Start the server in the background. Returns the links to print.
@@ -52,6 +54,7 @@ pub async fn start(
     handle: CoreHandle,
     memory: Memory,
     mode: &'static str,
+    books_dir: PathBuf,
 ) -> Result<Vec<String>> {
     anyhow::ensure!(dir.join("index.html").exists(), "no web UI files in {}", dir.display());
     let key = if bind.is_loopback() { None } else { Some(ui_key(&memory).await?) };
@@ -65,12 +68,14 @@ pub async fn start(
         links.push(format!("http://{ip}:{port}/?key={key}  (other devices on your network)"));
     }
 
-    let app = App { handle, memory, dir, key, mode };
+    let app = App { handle, memory, dir, key, mode, books_dir };
     let router = Router::new()
         .route("/api/chamber", get(chamber))
         .route("/api/sessions", get(sessions))
         .route("/api/sessions/{id}", get(session))
         .route("/api/search", get(search))
+        .route("/api/grimoire", get(grimoire))
+        .route("/api/books/{id}/file", get(book_file))
         .route("/ws", get(socket))
         .fallback(get(file))
         .layer(middleware::from_fn_with_state(app.clone(), guard))
@@ -189,6 +194,7 @@ async fn file(State(app): State<App>, uri: axum::http::Uri) -> Response {
     let path = match uri.path() {
         "/" => "index.html",
         "/archive" => "archive.html",
+        "/grimoire" => "grimoire.html",
         p => p.trim_start_matches('/'),
     };
     let Some(full) = safe_join(&app.dir, path) else {
@@ -215,7 +221,10 @@ fn content_type(path: &Path) -> &'static str {
     match path.extension().and_then(|e| e.to_str()).unwrap_or("") {
         "html" => "text/html; charset=utf-8",
         "css" => "text/css; charset=utf-8",
-        "js" => "text/javascript; charset=utf-8",
+        "js" | "mjs" => "text/javascript; charset=utf-8",
+        "wasm" => "application/wasm",
+        "ttf" => "font/ttf",
+        "pdf" => "application/pdf",
         "svg" => "image/svg+xml",
         "png" => "image/png",
         "jpg" | "jpeg" => "image/jpeg",
@@ -310,6 +319,39 @@ async fn search(State(app): State<App>, Query(q): Query<SearchQuery>) -> Result<
             "text": h.text,
         })).collect::<Vec<_>>(),
     })))
+}
+
+/// The shelf, the page open, and the questions asked.
+async fn grimoire(State(app): State<App>) -> Result<Json<Value>, Failure> {
+    let m = &app.memory;
+    let live = app.handle.live();
+    let (answered, right) = m.question_tally().await?;
+    Ok(Json(json!({
+        "dir": app.books_dir.display().to_string(),
+        "dir_exists": app.books_dir.is_dir(),
+        "open": live.session,
+        "indexing": live.indexing,
+        "reading": live.reading,
+        "current": m.current_book().await?.map(|b| b.id),
+        "books": m.books().await?,
+        "questions": m.questions(None, 60).await?,
+        "tally": { "answered": answered, "right": right },
+    })))
+}
+
+/// The PDF itself, for the viewer.
+async fn book_file(State(app): State<App>, UrlPath(id): UrlPath<i64>) -> Result<Response, Failure> {
+    let Some(book) = app.memory.book(id).await? else {
+        return Ok(StatusCode::NOT_FOUND.into_response());
+    };
+    let Some(full) = safe_join(&app.books_dir, &book.path) else {
+        return Ok(StatusCode::NOT_FOUND.into_response());
+    };
+    Ok(match tokio::fs::read(&full).await {
+        Ok(bytes) => ([(header::CONTENT_TYPE, "application/pdf"), (header::CACHE_CONTROL, "no-cache")], Body::from(bytes))
+            .into_response(),
+        Err(_) => (StatusCode::NOT_FOUND, Json(json!({ "error": "the file has left the books folder" }))).into_response(),
+    })
 }
 
 // --- the live line ----------------------------------------------------------
