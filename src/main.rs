@@ -41,6 +41,7 @@ optional: LLM_TEMPERATURE (0.8), PERSONA_PATH (./persona.md), DB_PATH (./lasthop
           KOKORO_DIR (./kokoro-multi-lang-v1_0), MODELS_DIR (./models)
 
 spoken commands: \"close the rite\" / \"end the session\" ends the session,
+                 \"begin / pause / reset the vigil\" drives the focus timer,
                  \"please say …\" speaks the rest into output.wav";
 
 #[tokio::main]

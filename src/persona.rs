@@ -12,7 +12,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::llm::{ChatMessage, Role, Sampling};
-use crate::memory::{Hit, Line, Speaker, UpcomingOath};
+use crate::memory::{Focus, Hit, Line, Speaker, UpcomingOath};
 use crate::rite::{PendingOath, Situation};
 use crate::speech_out::split_sentences;
 use crate::streak::Day;
@@ -92,6 +92,7 @@ pub fn stage_direction(situation: &Situation) -> Option<&'static str> {
     match situation {
         Situation::Greeting { .. } => Some("(The rite opens. You speak first.)"),
         Situation::AskOath => Some("(They ask to close the rite.)"),
+        Situation::VigilComplete { .. } => Some("(The vigil's time is up.)"),
         _ => None,
     }
 }
@@ -134,16 +135,33 @@ pub struct Snapshot {
     pub facts: Vec<String>,
     /// Lines from past sessions that match what I just said.
     pub recalled: Vec<Hit>,
+    /// Focused work recorded today.
+    pub focus_today: Focus,
+    /// The vigil under way, if any: whole minutes left, and whether it runs.
+    pub vigil: Option<(u32, bool)>,
 }
 
-/// Small numbers as spoken words, so she says them as given.
-fn number_word(n: u32) -> String {
-    const WORDS: [&str; 21] = [
+/// Numbers as spoken words, so she (and the voice) say them as given.
+pub fn number_word(n: u32) -> String {
+    const ONES: [&str; 20] = [
         "zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten",
         "eleven", "twelve", "thirteen", "fourteen", "fifteen", "sixteen", "seventeen", "eighteen",
-        "nineteen", "twenty",
+        "nineteen",
     ];
-    WORDS.get(n as usize).map(|w| w.to_string()).unwrap_or_else(|| n.to_string())
+    const TENS: [&str; 8] = ["twenty", "thirty", "forty", "fifty", "sixty", "seventy", "eighty", "ninety"];
+    match n {
+        0..20 => ONES[n as usize].to_string(),
+        20..100 if n % 10 == 0 => TENS[n as usize / 10 - 2].to_string(),
+        20..100 => format!("{} {}", TENS[n as usize / 10 - 2], ONES[n as usize % 10]),
+        100..1000 if n % 100 == 0 => format!("{} hundred", ONES[n as usize / 100]),
+        100..1000 => format!("{} hundred {}", ONES[n as usize / 100], number_word(n % 100)),
+        _ => n.to_string(),
+    }
+}
+
+/// "one minute", "twenty five minutes".
+pub fn minutes_words(n: u32) -> String {
+    format!("{} minute{}", number_word(n), if n == 1 { "" } else { "s" })
 }
 
 fn part_of_day(hour: u32) -> &'static str {
@@ -201,6 +219,20 @@ pub fn context(s: &Snapshot, situation: &Situation) -> String {
     }
     if let Some(o) = &s.upcoming_oath {
         c += &format!("Their oath for {}, already sworn: \"{}\".\n", day_name(o.day, s.today), o.text);
+    }
+    c += &match s.focus_today {
+        Focus { minutes: 0, .. } => "Focused work today: none recorded yet.\n".to_string(),
+        f => format!(
+            "Focused work today: {} in {} vigil{}.\n",
+            minutes_words(f.minutes),
+            number_word(f.vigils),
+            if f.vigils == 1 { "" } else { "s" }
+        ),
+    };
+    match s.vigil {
+        Some((left, true)) => c += &format!("A vigil is running now: {} left.\n", minutes_words(left)),
+        Some((left, false)) => c += &format!("A vigil is paused with {} left.\n", minutes_words(left)),
+        None => {}
     }
     if !s.facts.is_empty() {
         c += "What you know of them:\n";
@@ -281,6 +313,40 @@ fn instruction(s: &Snapshot, situation: &Situation) -> String {
                 "They have sworn tomorrow's oath: \"{oath}\". It is recorded. Seal it in one or two \
                  sentences and close the rite. Ask nothing."
             )
+        }
+        Situation::VigilComplete { minutes } => format!(
+            "Their vigil of {} has just ended and is recorded. Today's total, this vigil already \
+             included, is exactly {}: say that number as given and never add to it. In one or two \
+             sentences, announce the vigil complete and command a short rest before the next \
+             one. Do not close the rite. Ask nothing.",
+            minutes_words(*minutes),
+            minutes_words(s.focus_today.minutes)
+        ),
+        Situation::VigilLogged { minutes, yesterday, assumed } => {
+            let counted = if *assumed {
+                format!(
+                    "They gave no length, so it is counted as the standard vigil, {} in all; \
+                     do not ask how long it was.",
+                    minutes_words(*minutes)
+                )
+            } else {
+                format!("It is counted as {}.", minutes_words(*minutes))
+            };
+            if *yesterday {
+                format!(
+                    "They report focused work done yesterday, while you were away; it is recorded \
+                     for yesterday. {counted} Acknowledge it in one line, then answer the rest of \
+                     what they said or turn them to today's work."
+                )
+            } else {
+                format!(
+                    "They report focused work done while you were away; it is recorded. {counted} \
+                     Today's total, this report already included, is exactly {}: say that number \
+                     as given and never add to it. Acknowledge it in one line with that total, \
+                     then answer the rest of what they said or turn them to what comes next.",
+                    minutes_words(s.focus_today.minutes)
+                )
+            }
         }
     }
 }
@@ -531,7 +597,26 @@ mod tests {
                 speaker: Speaker::Me,
                 text: "I hate borrow errors".into(),
             }],
+            focus_today: Focus { minutes: 25, vigils: 1 },
+            vigil: Some((12, true)),
         }
+    }
+
+    #[test]
+    fn numbers_and_the_vigil_in_words() {
+        assert_eq!(number_word(7), "seven");
+        assert_eq!(number_word(25), "twenty five");
+        assert_eq!(number_word(40), "forty");
+        assert_eq!(number_word(125), "one hundred twenty five");
+        assert_eq!(minutes_words(1), "one minute");
+        let s = snapshot();
+        let c = context(&s, &Situation::VigilComplete { minutes: 25 });
+        assert!(c.contains("Focused work today: twenty five minutes in one vigil."), "{c}");
+        assert!(c.contains("A vigil is running now: twelve minutes left."));
+        assert!(c.contains("vigil of twenty five minutes has just ended"));
+        let c = context(&Snapshot { focus_today: Focus::default(), vigil: None, ..s }, &Situation::Conversation);
+        assert!(c.contains("Focused work today: none recorded yet."));
+        assert!(!c.contains("A vigil is"));
     }
 
     #[test]

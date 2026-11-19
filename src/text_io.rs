@@ -21,7 +21,8 @@ commands:
   /mute  /unmute          deafen her (closes the mic) / let her hear again
   /stop                   silence her: cut off the current reply
   /sleep /wake            pause / resume listening
-  /timer start|pause|reset   the vigil (25 min)
+  /timer start [min]|pause|reset   the vigil (25 min unless told)
+  /vigil [yesterday] [min]   a vigil you kept while she was not running (25 min)
   /kept  /broken          your verdict on the last oath
   /status                 the great work, the chain of seals, the oaths
   /facts                  what she knows of you;  /forget N  strikes fact N out
@@ -74,10 +75,32 @@ fn parse_command(line: &str) -> Option<Result<Typed, String>> {
         ("sleep" | "slumber", "") => cmd(Command::Sleep { on: true }),
         ("wake", "") => cmd(Command::Sleep { on: false }),
         ("end" | "quit" | "close", "") => cmd(Command::EndSession),
-        ("timer", "start") | ("begin", "") => cmd(Command::TimerStart),
         ("timer", "pause") | ("hold", "") => cmd(Command::TimerPause),
         ("timer", "reset") | ("anew", "") => cmd(Command::TimerReset),
-        ("timer", _) => Err("usage: /timer start | /timer pause | /timer reset".to_string()),
+        ("timer", t) | ("begin", t) if head == "begin" || t.starts_with("start") => {
+            let n = if head == "begin" { t } else { t["start".len()..].trim() };
+            match n {
+                "" => cmd(Command::TimerStart { minutes: None }),
+                n => match n.parse() {
+                    Ok(m) => cmd(Command::TimerStart { minutes: Some(m) }),
+                    Err(_) => Err("usage: /timer start [minutes]".to_string()),
+                },
+            }
+        }
+        ("timer", _) => Err("usage: /timer start [minutes] | /timer pause | /timer reset".to_string()),
+        ("vigil", t) => {
+            let (yesterday, n) = match t.strip_prefix("yesterday") {
+                Some(rest) => (true, rest.trim()),
+                None => (false, t),
+            };
+            match n {
+                "" => cmd(Command::LogVigil { minutes: 25, yesterday }),
+                n => match n.parse() {
+                    Ok(minutes) => cmd(Command::LogVigil { minutes, yesterday }),
+                    Err(_) => Err("usage: /vigil [yesterday] [minutes]".to_string()),
+                },
+            }
+        }
         ("kept", "") => cmd(Command::OathVerdict { kept: true }),
         ("broken", "") => cmd(Command::OathVerdict { kept: false }),
         ("mission", "") => Ok(Typed::Query(Query::Mission)),
@@ -112,6 +135,8 @@ async fn answer(memory: &Memory, query: Query) -> anyhow::Result<String> {
                 memory.mission().await?,
                 memory.streak().await?.current(today)
             );
+            let focus = memory.focus_on(today).await?;
+            out += &format!("\nfocused today: {} min in {} vigil(s)", focus.minutes, focus.vigils);
             if let Some(o) = memory.pending_oath(today, 0).await? {
                 out += &format!("\noath due {} (awaits /kept or /broken): {}", o.day, o.text);
             }
@@ -252,7 +277,12 @@ mod tests {
     fn parses_commands() {
         let cmd = |c| Some(Ok(Typed::Command(c)));
         assert_eq!(parse_command("/mute"), cmd(Command::Mute { on: true }));
-        assert_eq!(parse_command("/timer  start"), cmd(Command::TimerStart));
+        assert_eq!(parse_command("/timer  start"), cmd(Command::TimerStart { minutes: None }));
+        assert_eq!(parse_command("/timer start 50"), cmd(Command::TimerStart { minutes: Some(50) }));
+        assert_eq!(parse_command("/begin 10"), cmd(Command::TimerStart { minutes: Some(10) }));
+        assert_eq!(parse_command("/vigil"), cmd(Command::LogVigil { minutes: 25, yesterday: false }));
+        assert_eq!(parse_command("/vigil yesterday 40"), cmd(Command::LogVigil { minutes: 40, yesterday: true }));
+        assert!(matches!(parse_command("/vigil soon"), Some(Err(_))));
         assert_eq!(parse_command("/end"), cmd(Command::EndSession));
         assert_eq!(parse_command("/kept"), cmd(Command::OathVerdict { kept: true }));
         assert_eq!(parse_command("/forget 12"), cmd(Command::ForgetFact { id: 12 }));

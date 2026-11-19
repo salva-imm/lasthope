@@ -5,6 +5,7 @@
 //! - sessions: start, end, summary, the oath sworn, its verdict, focused minutes
 //! - messages: every line, saved as it is said (a crash loses nothing), with
 //!   FTS5 full-text search kept in sync by triggers
+//! - vigils: focused work, timed by the vigil or reported by me, by day
 //! - facts: what she has learned about me, each deletable
 //! - state: the mission and the streak
 //!
@@ -62,6 +63,18 @@ CREATE TRIGGER IF NOT EXISTS messages_au AFTER UPDATE ON messages BEGIN
     INSERT INTO messages_fts(messages_fts, rowid, text) VALUES ('delete', old.id, old.text);
     INSERT INTO messages_fts(rowid, text) VALUES (new.id, new.text);
 END;
+
+-- focused work: each completed vigil, or one I reported (done while the
+-- program was not running). sessions.focused_minutes counts timed ones only.
+CREATE TABLE IF NOT EXISTS vigils (
+    id         INTEGER PRIMARY KEY,
+    session_id INTEGER REFERENCES sessions(id) ON DELETE SET NULL,
+    day        TEXT NOT NULL,
+    minutes    INTEGER NOT NULL CHECK (minutes > 0),
+    source     TEXT NOT NULL CHECK (source IN ('timer', 'told')),
+    at         TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
+);
+CREATE INDEX IF NOT EXISTS vigils_day ON vigils(day);
 
 CREATE TABLE IF NOT EXISTS facts (
     id         INTEGER PRIMARY KEY,
@@ -127,6 +140,22 @@ pub struct Hit {
 pub struct UpcomingOath {
     pub text: String,
     pub day: Day,
+}
+
+/// Where a vigil's minutes come from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VigilSource {
+    /// The timer ran to the end.
+    Timer,
+    /// I said I did it.
+    Told,
+}
+
+/// Focused work on one day.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Focus {
+    pub minutes: u32,
+    pub vigils: u32,
 }
 
 #[derive(Clone)]
@@ -364,6 +393,41 @@ impl Memory {
         Ok(Streak { count: count as u32, last: last.as_deref().and_then(Day::parse) })
     }
 
+    // --- vigils -----------------------------------------------------------
+
+    /// Record focused work on `day`. Timed vigils also count on the session.
+    pub async fn add_vigil(&self, session: i64, day: Day, minutes: u32, source: VigilSource) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("INSERT INTO vigils (session_id, day, minutes, source) VALUES (?1, ?2, ?3, ?4)")
+            .bind(session)
+            .bind(day.to_string())
+            .bind(minutes)
+            .bind(match source {
+                VigilSource::Timer => "timer",
+                VigilSource::Told => "told",
+            })
+            .execute(&mut *tx)
+            .await?;
+        if source == VigilSource::Timer {
+            sqlx::query("UPDATE sessions SET focused_minutes = focused_minutes + ?2 WHERE id = ?1")
+                .bind(session)
+                .bind(minutes)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn focus_on(&self, day: Day) -> Result<Focus> {
+        let (minutes, vigils): (i64, i64) =
+            sqlx::query_as("SELECT COALESCE(sum(minutes), 0), count(*) FROM vigils WHERE day = ?1")
+                .bind(day.to_string())
+                .fetch_one(&self.pool)
+                .await?;
+        Ok(Focus { minutes: minutes as u32, vigils: vigils as u32 })
+    }
+
     // --- mission, settings ----------------------------------------------
 
     pub async fn mission(&self) -> Result<String> {
@@ -538,6 +602,27 @@ mod tests {
         assert!(m.record_verdict(s1, false).await.is_err());
         assert!(m.record_verdict(s2, true).await.is_err());
         assert_eq!(m.pending_oath(today.next(), s2).await.unwrap(), None);
+        cleanup(path);
+    }
+
+    #[tokio::test]
+    async fn vigils_count_by_day() {
+        let (m, path) = temp_memory().await;
+        let today = m.today().await.unwrap();
+        let yesterday = Day(today.0 - 1);
+        let s = m.start_session().await.unwrap();
+        assert_eq!(m.focus_on(today).await.unwrap(), Focus::default());
+        m.add_vigil(s, today, 25, VigilSource::Timer).await.unwrap();
+        m.add_vigil(s, today, 40, VigilSource::Told).await.unwrap();
+        m.add_vigil(s, yesterday, 50, VigilSource::Told).await.unwrap();
+        assert_eq!(m.focus_on(today).await.unwrap(), Focus { minutes: 65, vigils: 2 });
+        assert_eq!(m.focus_on(yesterday).await.unwrap(), Focus { minutes: 50, vigils: 1 });
+        let on_session: i64 = sqlx::query_scalar("SELECT focused_minutes FROM sessions WHERE id = ?1")
+            .bind(s)
+            .fetch_one(&m.pool)
+            .await
+            .unwrap();
+        assert_eq!(on_session, 25); // timed vigils only
         cleanup(path);
     }
 

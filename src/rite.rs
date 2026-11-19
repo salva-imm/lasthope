@@ -34,6 +34,11 @@ pub enum Situation {
     AskOath,
     /// I just swore tomorrow's oath (already recorded): seal it and close.
     OathSworn,
+    /// The vigil's time is up (already recorded): she announces it.
+    VigilComplete { minutes: u32 },
+    /// I reported focused work done elsewhere (already recorded).
+    /// `assumed`: no length was said, so 25 minutes per vigil were counted.
+    VigilLogged { minutes: u32, yesterday: bool, assumed: bool },
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -84,8 +89,14 @@ impl Rite {
         matches!(self.phase, Phase::AwaitingVerdict { .. })
     }
 
-    #[cfg(test)]
-    fn closing(&self) -> bool {
+    /// My words now are a conversation (or a verdict), not tomorrow's oath:
+    /// a report of a vigil kept elsewhere is read from them.
+    pub fn takes_reports(&self) -> bool {
+        matches!(self.phase, Phase::Open | Phase::AwaitingVerdict { .. })
+    }
+
+    /// The rite is closing: nothing more is said but the seal.
+    pub fn closing(&self) -> bool {
         self.phase == Phase::Closing
     }
 

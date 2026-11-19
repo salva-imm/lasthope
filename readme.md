@@ -3,8 +3,8 @@
 A personal voice companion written in Rust. You speak, she listens, thinks and answers aloud.
 Hearing and speaking run locally; only the language model call goes to the cloud.
 
-> Work in progress. Phases 1-3 of 5 are done: the foundation, her character and
-> conversation, memory and sessions. The focus timer's voice and the web UI come next.
+> Work in progress. Phases 1-4 of 5 are done: the foundation, her character and
+> conversation, memory and sessions, the vigil. The web UI comes next.
 
 ## How it works
 
@@ -44,7 +44,7 @@ src/
   rite.rs        the shape of a session: greeting, oath verdict, oath, close (pure state machine)
   streak.rs      days and the chain of seals (pure logic)
   memory.rs      SQLite: sessions, messages (+ full-text search), facts, mission, streak
-  timer.rs       the vigil (focus timer)
+  timer.rs       the vigil (focus timer) and the spoken words for it
   text_io.rs     stdin/stdout mode, slash-commands, event printer
 ```
 
@@ -52,7 +52,8 @@ The core owns all state. Anything that drives it (voice, `--text`, later the web
 sends `Command`s and watches `Event`s:
 
 - Commands: `mute`, `stop_speaking`, `sleep`, `end_session`, `oath_verdict`, `set_mission`,
-  `forget_fact`, `timer_start`, `timer_pause`, `timer_reset`
+  `forget_fact`, `timer_start` (optional `minutes`), `timer_pause`, `timer_reset`,
+  `log_vigil` (`minutes`, optional `yesterday`)
 - Events: `session_started`, `state_changed`, `user_spoke`, `she_spoke`, `timer_tick`,
   `memory_changed`, `notice`, `error`, `session_ended`
 
@@ -93,9 +94,11 @@ printf 'What is the great work?\nAnd what is a vigil?\n' | cargo run --release -
 
 Just talk. Everything you say goes to her, with the recent conversation
 (the last 16 lines, up to about 4000 characters) so she follows the thread.
-Two spoken phrases are commands instead:
+These spoken phrases are commands instead:
 
 - **"close the rite"** or **"end the session"** (on its own): ends the session.
+- **"begin the vigil"** / **"pause the vigil"** / **"reset the vigil"** (on their own; "start",
+  "resume", "hold", "timer" work too): see [The vigil](#the-vigil).
 - **"please say …"** (or "please generate …", "please store …"): the rest is
   spoken into `output.wav` instead of being answered (voice mode only).
 
@@ -119,6 +122,7 @@ to remember on its own.
 - **sessions**: start, end, summary, the oath sworn, its verdict, focused minutes
 - **messages**: every line, saved the moment it is said (a crash loses nothing), with FTS5
   full-text search; lines from past sessions that match what you just said are recalled into the prompt
+- **vigils**: focused work by day, timed or reported by you
 - **facts**: what she has learned about you, each deletable
 - **state**: the great work (your mission) and the chain of seals (the streak)
 
@@ -143,6 +147,25 @@ request is retried up to four times, and she says so once per reply: *"Retrying,
 the limit."* or *"Retrying, the API is not answering."* If every try fails she says that too
 (*"…Give it a minute, then speak again."*). These status lines are never saved to memory.
 
+### The vigil
+
+A focus timer, twenty-five minutes unless you say otherwise ("begin a fifty minute vigil",
+`/timer start 50`). It keeps running while you talk to her, sleep her or go quiet; a paused
+vigil resumes where it stopped.
+
+- When it ends she announces it aloud (right after her current sentence, if she is speaking),
+  and its minutes are recorded on the session and the day.
+- Only completed vigils count. A vigil paused, reset or left running when the rite closes is
+  not counted.
+- **Kept one while she was not running?** Just tell her: "I completed a vigil", "I did two
+  vigils yesterday", "I did a forty minute vigil this morning", "I did an hour of focused
+  work". The Rust code reads it from your words (plain past-tense statements only; questions,
+  plans and "I didn't…" are not reports), records it for today or yesterday, and she
+  acknowledges it. Without a length, a vigil counts as twenty-five minutes. Saying "I
+  completed it" just after the timer ended does not count that vigil twice. `/vigil 40` and
+  `/vigil yesterday 40` do the same by command.
+- She knows today's total and the running vigil, so she can hold you to the mission.
+
 ### Commands
 
 Type these in the terminal, in either mode:
@@ -151,9 +174,10 @@ Type these in the terminal, in either mode:
 /mute  /unmute               deafen her (closes the mic) / let her hear again
 /stop                        silence her: cut off the current reply
 /sleep /wake                 pause / resume listening
-/timer start|pause|reset     the vigil (25 min)
+/timer start [min]|pause|reset   the vigil (25 min unless told)
+/vigil [yesterday] [min]     record a vigil you kept while she was not running (25 min)
 /kept  /broken               your verdict on the last oath
-/status                      the great work, the chain of seals, the oaths
+/status                      the great work, the chain of seals, the oaths, today's focus
 /facts   /forget N           what she knows of you; strike fact N out
 /mission [text]              show or rename the great work
 /search words                search everything ever said

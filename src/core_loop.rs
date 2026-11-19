@@ -10,6 +10,7 @@
 //! Turns run as background tasks so commands (stop, mute, end) are handled
 //! immediately, even mid-reply. Results carry a turn id; stale ones are dropped.
 
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::{Arc, Condvar, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -23,11 +24,11 @@ use tokio::time::MissedTickBehavior;
 
 use crate::audio_in::Gate;
 use crate::llm::{self, ChatMessage, LlmClient, Trouble};
-use crate::memory::{Memory, Speaker};
+use crate::memory::{Memory, Speaker, VigilSource};
 use crate::persona::{self, Persona, Snapshot};
 use crate::rite::{Action, Rite, Situation};
 use crate::speech_out::Mouth;
-use crate::timer::{DEFAULT_VIGIL, Vigil};
+use crate::timer::{DEFAULT_VIGIL, MAX_MINUTES, Vigil, VigilCmd, vigil_command, vigil_report};
 
 /// Facts sent with each request (the most recent ones).
 const MAX_FACTS_IN_PROMPT: usize = 40;
@@ -38,6 +39,9 @@ const SUMMARY_CHARS: usize = 12_000;
 const SUMMARY_TIMEOUT: Duration = Duration::from_secs(45);
 
 const WAV_PATH: &str = "output.wav";
+/// A report of a vigil this soon after the timer ended one, with no length or
+/// count of its own, is about that same vigil and not counted twice.
+const SAME_VIGIL_WINDOW: Duration = Duration::from_secs(30 * 60);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -64,9 +68,19 @@ pub enum Command {
     SetMission { text: String },
     /// Strike a fact out of her memory.
     ForgetFact { id: i64 },
-    TimerStart,
+    /// Begin a vigil (of `minutes`, default 25) or resume a paused one.
+    TimerStart {
+        #[serde(default)]
+        minutes: Option<u32>,
+    },
     TimerPause,
     TimerReset,
+    /// Record focused work done while the program was not running.
+    LogVigil {
+        minutes: u32,
+        #[serde(default)]
+        yesterday: bool,
+    },
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -204,6 +218,8 @@ enum Spoken {
     SaveWav(String),
     /// "close the rite", "end the session".
     EndSession,
+    /// "begin the vigil", "pause the vigil", "reset the vigil".
+    Vigil(VigilCmd),
     Talk,
 }
 
@@ -239,7 +255,10 @@ fn spoken_command(text: &str) -> Spoken {
     for filler in [" now", " please", " for tonight", " lasthope", " last hope"] {
         core = core.strip_suffix(filler).unwrap_or(core);
     }
-    if END.contains(&core) { Spoken::EndSession } else { Spoken::Talk }
+    if END.contains(&core) {
+        return Spoken::EndSession;
+    }
+    vigil_command(text).map_or(Spoken::Talk, Spoken::Vigil)
 }
 
 pub struct Core {
@@ -272,11 +291,13 @@ pub struct Core {
     last_heard: String,
     /// A reply the rite asked for while she was busy (e.g. "close" pressed
     /// while she speaks); started as soon as her turn is over.
-    deferred: Option<Situation>,
+    deferred: VecDeque<Situation>,
     /// What the reply in flight is about.
     replying_to: Option<Situation>,
     /// Why the reply in flight is being retried (she says it once per turn).
     trouble: Option<Trouble>,
+    /// When the timer last finished a vigil.
+    last_bell: Option<Instant>,
 }
 
 impl Core {
@@ -317,9 +338,10 @@ impl Core {
             close_after_reply: false,
             published: None,
             last_heard: String::new(),
-            deferred: None,
+            deferred: VecDeque::new(),
             replying_to: None,
             trouble: None,
+            last_bell: None,
         }
     }
 
@@ -342,10 +364,10 @@ impl Core {
                     None => Flow::Stop,
                 },
                 Some((id, done)) = self.done_rx.recv() => self.on_done(id, done).await,
-                _ = tick.tick() => { self.on_tick(); Flow::Continue }
+                _ = tick.tick() => { self.on_tick().await; Flow::Continue }
             };
             if flow == Flow::Continue && self.turn == Turn::Idle {
-                if let Some(situation) = self.deferred.take() {
+                if let Some(situation) = self.deferred.pop_front() {
                     self.start_reply(situation).await;
                 }
             }
@@ -391,6 +413,14 @@ impl Core {
             t.abort();
         }
         self.gate.set(false);
+        let now = Instant::now();
+        if !self.vigil.elapsed(now).is_zero() && !self.vigil.remaining(now).is_zero() {
+            self.notice(format!(
+                "the vigil is left unfinished ({} of {} min); unfinished vigils are not counted",
+                self.vigil.elapsed(now).as_secs() / 60,
+                self.vigil.total().as_secs() / 60
+            ));
+        }
         if self.session != 0 {
             self.notice("she records the night");
             let summary = self.summarize(self.session).await;
@@ -522,19 +552,31 @@ impl Core {
                 self.start_save(content);
                 Flow::Continue
             }
+            Spoken::Vigil(cmd) => {
+                self.vigil_cmd(cmd, true);
+                Flow::Continue
+            }
             Spoken::Talk => {
                 if let Err(e) = self.memory.add_message(self.session, Speaker::Me, text).await {
                     self.error("saving what you said", e);
                 }
                 self.last_heard = text.to_string();
-                let actions = self.rite.heard(text);
+                let logged = self.heard_report(text).await;
+                let mut actions = self.rite.heard(text);
+                if let Some(situation) = logged {
+                    // she acknowledges the vigil, unless the rite wants something else
+                    for a in &mut actions {
+                        if *a == Action::Reply(Situation::Conversation) {
+                            *a = Action::Reply(situation.clone());
+                        }
+                    }
+                }
                 self.apply(actions).await
             }
         }
     }
 
     async fn on_command(&mut self, cmd: Command) -> Flow {
-        let now = Instant::now();
         match cmd {
             Command::Mute { on } => self.muted = on,
             Command::Sleep { on } => self.asleep = on,
@@ -565,27 +607,124 @@ impl Core {
                 Ok(false) => self.notice(format!("no fact {id}")),
                 Err(e) => self.error("forgetting", e),
             },
-            Command::TimerStart => {
-                self.vigil.start(now);
-                self.emit_tick(now);
-            }
-            Command::TimerPause => {
-                self.vigil.pause(now);
-                self.emit_tick(now);
-            }
-            Command::TimerReset => {
-                self.vigil.reset();
-                self.emit_tick(now);
+            Command::TimerStart { minutes } => self.vigil_cmd(VigilCmd::Start { minutes }, false),
+            Command::TimerPause => self.vigil_cmd(VigilCmd::Pause, false),
+            Command::TimerReset => self.vigil_cmd(VigilCmd::Reset, false),
+            Command::LogVigil { minutes, yesterday } => {
+                if (1..=MAX_MINUTES).contains(&minutes) {
+                    self.log_vigil(minutes, yesterday).await;
+                } else {
+                    self.notice(format!("a vigil is one to {MAX_MINUTES} minutes"));
+                }
             }
         }
         Flow::Continue
+    }
+
+    /// Start, pause or reset the vigil. Spoken commands get a spoken answer;
+    /// commands (typed, or the UI) only a notice.
+    fn vigil_cmd(&mut self, cmd: VigilCmd, speak: bool) {
+        let now = Instant::now();
+        let left = |v: &Vigil| {
+            let secs = v.remaining(now).as_secs();
+            if secs < 60 {
+                "less than a minute remains".to_string()
+            } else {
+                format!("{} remain", persona::minutes_words(secs.div_ceil(60) as u32))
+            }
+        };
+        let line = match cmd {
+            VigilCmd::Start { .. } if self.vigil.running() => {
+                format!("The vigil is already running; {}.", left(&self.vigil))
+            }
+            VigilCmd::Start { minutes } => {
+                let partway = !self.vigil.elapsed(now).is_zero() && !self.vigil.remaining(now).is_zero();
+                if partway && minutes.is_none() {
+                    self.vigil.start(now);
+                    format!("The vigil resumes; {}.", left(&self.vigil))
+                } else {
+                    let total = minutes.map_or(DEFAULT_VIGIL, |m| Duration::from_secs(u64::from(m) * 60));
+                    self.vigil = Vigil::new(total);
+                    self.vigil.start(now);
+                    format!("The vigil begins: {}.", persona::minutes_words((total.as_secs() / 60) as u32))
+                }
+            }
+            VigilCmd::Pause if self.vigil.running() => {
+                self.vigil.pause(now);
+                format!("The vigil is held; {}.", left(&self.vigil))
+            }
+            VigilCmd::Pause => "No vigil is running.".to_string(),
+            VigilCmd::Reset => {
+                self.vigil.reset();
+                "The vigil is cleared.".to_string()
+            }
+        };
+        self.emit_tick(now);
+        self.notice(line.clone());
+        if speak {
+            self.speak_line(line);
+        }
+    }
+
+    /// The timer ran out: record the minutes and let her announce it.
+    async fn vigil_complete(&mut self, now: Instant) {
+        let minutes = (self.vigil.total().as_secs() / 60).max(1) as u32;
+        self.last_bell = Some(now);
+        match self.record_vigil(minutes, false, VigilSource::Timer).await {
+            Ok(total) => self.notice(format!("the vigil is complete: {minutes} min recorded, {total} min today")),
+            Err(e) => self.error("recording the vigil", e),
+        }
+        if self.close_after_reply || self.rite.closing() {
+            return;
+        }
+        let actions = vec![Action::Reply(Situation::VigilComplete { minutes })];
+        self.apply(actions).await;
+    }
+
+    /// If what I said reports a vigil kept elsewhere, record it and return
+    /// what she should acknowledge.
+    async fn heard_report(&mut self, text: &str) -> Option<Situation> {
+        if !self.rite.takes_reports() {
+            return None; // e.g. tomorrow's oath: "I swear to complete two vigils"
+        }
+        let report = vigil_report(text)?;
+        let just_rang = self.last_bell.is_some_and(|t| t.elapsed() < SAME_VIGIL_WINDOW);
+        if just_rang && !report.explicit && !report.yesterday {
+            self.notice("that vigil is already recorded");
+            return None;
+        }
+        self.log_vigil(report.minutes, report.yesterday).await;
+        Some(Situation::VigilLogged {
+            minutes: report.minutes,
+            yesterday: report.yesterday,
+            assumed: report.assumed,
+        })
+    }
+
+    async fn log_vigil(&mut self, minutes: u32, yesterday: bool) {
+        match self.record_vigil(minutes, yesterday, VigilSource::Told).await {
+            Ok(total) => self.notice(format!(
+                "{minutes} min of focused work recorded for {} ({total} min that day)",
+                if yesterday { "yesterday" } else { "today" }
+            )),
+            Err(e) => self.error("recording the vigil", e),
+        }
+    }
+
+    /// Store a vigil; returns the day's total minutes.
+    async fn record_vigil(&self, minutes: u32, yesterday: bool, source: VigilSource) -> Result<u32> {
+        let today = self.memory.today().await?;
+        let day = if yesterday { crate::streak::Day(today.0 - 1) } else { today };
+        self.memory.add_vigil(self.session, day, minutes, source).await?;
+        self.emit(Event::MemoryChanged);
+        Ok(self.memory.focus_on(day).await?.minutes)
     }
 
     /// Carry out what the rite decided.
     async fn apply(&mut self, actions: Vec<Action>) -> Flow {
         for action in actions {
             match action {
-                Action::Reply(situation) if self.turn != Turn::Idle => self.deferred = Some(situation),
+                Action::Reply(situation) if self.turn != Turn::Idle => self.deferred.push_back(situation),
                 Action::Reply(situation) => self.start_reply(situation).await,
                 Action::RecordVerdict { oath_session, kept } => {
                     match self.memory.record_verdict(oath_session, kept).await {
@@ -645,8 +784,12 @@ impl Core {
             }
             Done::Reply(Err(e)) => {
                 self.emit(Event::Error { message: format!("{e:#}") });
-                self.replying_to = None;
-                let line = self.trouble.take().map_or(llm::FAILED_LINE, Trouble::gave_up_line);
+                let trouble = self.trouble.take();
+                let line = match self.replying_to.take() {
+                    // the bell must ring even without her mind
+                    Some(Situation::VigilComplete { .. }) => "The vigil is complete. Rest a moment, then return to the work.",
+                    _ => trouble.map_or(llm::FAILED_LINE, Trouble::gave_up_line),
+                };
                 // spoken, but not part of the conversation: never saved
                 self.notice(line);
                 self.start_speaking(line.to_string());
@@ -662,13 +805,13 @@ impl Core {
         if self.close_after_reply { Flow::Stop } else { Flow::Continue }
     }
 
-    fn on_tick(&mut self) {
+    async fn on_tick(&mut self) {
         let now = Instant::now();
         if self.vigil.running() {
             let finished = self.vigil.poll_finished(now);
             self.emit_tick(now);
             if finished {
-                self.notice("the vigil is complete");
+                self.vigil_complete(now).await;
             }
         }
     }
@@ -708,6 +851,13 @@ impl Core {
             upcoming_oath: m.upcoming_oath(today).await?,
             facts,
             recalled,
+            focus_today: m.focus_on(today).await?,
+            vigil: {
+                let now = Instant::now();
+                let left = self.vigil.remaining(now);
+                let under_way = !self.vigil.elapsed(now).is_zero() && !left.is_zero();
+                under_way.then(|| (left.as_secs().div_ceil(60) as u32, self.vigil.running()))
+            },
         };
         let context = persona::context(&snapshot, situation);
         let lines = m.session_lines(self.session).await?;
@@ -745,6 +895,12 @@ impl Core {
     fn say_status(&self, line: &str) {
         self.notice(line);
         let _ = self.mouth.speak(line.to_string(), Arc::new(AtomicBool::new(false)));
+    }
+
+    /// Say a fixed line (not from the model, not saved) as a turn of its own.
+    fn speak_line(&mut self, text: String) {
+        self.next_turn(Turn::Speaking);
+        self.start_speaking(text);
     }
 
     fn start_speaking(&mut self, text: String) {
@@ -807,6 +963,9 @@ mod tests {
         assert_eq!(spoken_command("Close the rite."), Spoken::EndSession);
         assert_eq!(spoken_command("Okay, close the right now."), Spoken::EndSession);
         assert_eq!(spoken_command("End the session, Lasthope."), Spoken::EndSession);
+        assert_eq!(spoken_command("Begin the vigil."), Spoken::Vigil(VigilCmd::Start { minutes: None }));
+        assert_eq!(spoken_command("Pause the vigil."), Spoken::Vigil(VigilCmd::Pause));
+        assert_eq!(spoken_command("I did a vigil."), Spoken::Talk);
         assert_eq!(spoken_command("We should end the session soon."), Spoken::Talk);
         assert_eq!(spoken_command("Talk to me, what is an oath?"), Spoken::Talk);
         assert_eq!(spoken_command("Say something."), Spoken::Talk);
@@ -817,7 +976,11 @@ mod tests {
         let c: Command = serde_json::from_str(r#"{"cmd":"mute","on":true}"#).unwrap();
         assert_eq!(c, Command::Mute { on: true });
         let c: Command = serde_json::from_str(r#"{"cmd":"timer_start"}"#).unwrap();
-        assert_eq!(c, Command::TimerStart);
+        assert_eq!(c, Command::TimerStart { minutes: None });
+        let c: Command = serde_json::from_str(r#"{"cmd":"timer_start","minutes":50}"#).unwrap();
+        assert_eq!(c, Command::TimerStart { minutes: Some(50) });
+        let c: Command = serde_json::from_str(r#"{"cmd":"log_vigil","minutes":40}"#).unwrap();
+        assert_eq!(c, Command::LogVigil { minutes: 40, yesterday: false });
         let c: Command = serde_json::from_str(r#"{"cmd":"oath_verdict","kept":false}"#).unwrap();
         assert_eq!(c, Command::OathVerdict { kept: false });
         let c: Command = serde_json::from_str(r#"{"cmd":"forget_fact","id":3}"#).unwrap();
