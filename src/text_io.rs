@@ -13,6 +13,7 @@ use anyhow::{Result, anyhow};
 use tokio::sync::{broadcast, oneshot};
 
 use crate::core_loop::{Command, CoreHandle, Event, Input, Pacer, State};
+use crate::memory::{Memory, Speaker};
 use crate::speech_out::Mouth;
 
 pub const COMMANDS_HELP: &str = "\
@@ -21,7 +22,12 @@ commands:
   /stop                   silence her: cut off the current reply
   /sleep /wake            pause / resume listening
   /timer start|pause|reset   the vigil (25 min)
-  /end                    close the rite (end the session)
+  /kept  /broken          your verdict on the last oath
+  /status                 the great work, the chain of seals, the oaths
+  /facts                  what she knows of you;  /forget N  strikes fact N out
+  /mission [text]         show or rename the great work
+  /search words           search everything ever said
+  /end                    close the rite (she asks tomorrow's oath; /end again skips it)
   /help";
 
 /// Text mode "voice": the reply is already printed from the SheSpoke event.
@@ -41,21 +47,93 @@ impl Mouth for TextMouth {
     }
 }
 
-fn parse_command(line: &str) -> Option<Result<Command, String>> {
+/// Read-only questions answered straight from memory.
+#[derive(Debug, PartialEq, Eq)]
+enum Query {
+    Status,
+    Facts,
+    Mission,
+    Search(String),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum Typed {
+    Command(Command),
+    Query(Query),
+}
+
+fn parse_command(line: &str) -> Option<Result<Typed, String>> {
     let rest = line.strip_prefix('/')?;
-    let words: Vec<&str> = rest.split_whitespace().collect();
-    Some(match words.as_slice() {
-        ["mute"] | ["deafen"] => Ok(Command::Mute { on: true }),
-        ["unmute"] => Ok(Command::Mute { on: false }),
-        ["stop"] | ["silence"] => Ok(Command::StopSpeaking),
-        ["sleep"] | ["slumber"] => Ok(Command::Sleep { on: true }),
-        ["wake"] => Ok(Command::Sleep { on: false }),
-        ["end"] | ["quit"] | ["close"] => Ok(Command::EndSession),
-        ["timer", "start"] | ["begin"] => Ok(Command::TimerStart),
-        ["timer", "pause"] | ["hold"] => Ok(Command::TimerPause),
-        ["timer", "reset"] | ["anew"] => Ok(Command::TimerReset),
-        ["timer", ..] => Err("usage: /timer start | /timer pause | /timer reset".to_string()),
+    let (head, tail) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
+    let tail = tail.trim();
+    let cmd = |c| Ok(Typed::Command(c));
+    Some(match (head, tail) {
+        ("mute" | "deafen", "") => cmd(Command::Mute { on: true }),
+        ("unmute", "") => cmd(Command::Mute { on: false }),
+        ("stop" | "silence", "") => cmd(Command::StopSpeaking),
+        ("sleep" | "slumber", "") => cmd(Command::Sleep { on: true }),
+        ("wake", "") => cmd(Command::Sleep { on: false }),
+        ("end" | "quit" | "close", "") => cmd(Command::EndSession),
+        ("timer", "start") | ("begin", "") => cmd(Command::TimerStart),
+        ("timer", "pause") | ("hold", "") => cmd(Command::TimerPause),
+        ("timer", "reset") | ("anew", "") => cmd(Command::TimerReset),
+        ("timer", _) => Err("usage: /timer start | /timer pause | /timer reset".to_string()),
+        ("kept", "") => cmd(Command::OathVerdict { kept: true }),
+        ("broken", "") => cmd(Command::OathVerdict { kept: false }),
+        ("mission", "") => Ok(Typed::Query(Query::Mission)),
+        ("mission", text) => cmd(Command::SetMission { text: text.to_string() }),
+        ("forget", n) => match n.parse() {
+            Ok(id) => cmd(Command::ForgetFact { id }),
+            Err(_) => Err("usage: /forget N   (numbers from /facts)".to_string()),
+        },
+        ("status", "") => Ok(Typed::Query(Query::Status)),
+        ("facts", "") => Ok(Typed::Query(Query::Facts)),
+        ("search", "") => Err("usage: /search words".to_string()),
+        ("search", q) => Ok(Typed::Query(Query::Search(q.to_string()))),
         _ => Err(COMMANDS_HELP.to_string()),
+    })
+}
+
+async fn answer(memory: &Memory, query: Query) -> anyhow::Result<String> {
+    Ok(match query {
+        Query::Mission => format!("the great work: {}", memory.mission().await?),
+        Query::Facts => {
+            let facts = memory.facts().await?;
+            if facts.is_empty() {
+                "she knows nothing of you yet".into()
+            } else {
+                facts.iter().map(|f| format!("  {:>3}  {}", f.id, f.text)).collect::<Vec<_>>().join("\n")
+            }
+        }
+        Query::Status => {
+            let today = memory.today().await?;
+            let mut out = format!(
+                "the great work: {}\nthe chain of seals: {}",
+                memory.mission().await?,
+                memory.streak().await?.current(today)
+            );
+            if let Some(o) = memory.pending_oath(today, 0).await? {
+                out += &format!("\noath due {} (awaits /kept or /broken): {}", o.day, o.text);
+            }
+            if let Some(o) = memory.upcoming_oath(today).await? {
+                out += &format!("\noath for {} {}: {}", o.day.weekday(), o.day, o.text);
+            }
+            out
+        }
+        Query::Search(q) => {
+            let hits = memory.search(&q, 10, None).await?;
+            if hits.is_empty() {
+                "nothing found".into()
+            } else {
+                hits.iter()
+                    .map(|h| {
+                        let who = if h.speaker == Speaker::Me { "you" } else { "her" };
+                        format!("  {} #{} {who}: {}", h.day, h.session, h.text)
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            }
+        }
     })
 }
 
@@ -63,7 +141,13 @@ fn parse_command(line: &str) -> Option<Result<Command, String>> {
 /// rest is treated as heard speech. A typed line waits until her current turn
 /// is over (see `Pacer`); commands go through at once. On EOF, text mode ends
 /// the session.
-pub fn spawn_stdin(handle: CoreHandle, pacer: Pacer, end_on_eof: bool) {
+pub fn spawn_stdin(
+    handle: CoreHandle,
+    pacer: Pacer,
+    memory: Memory,
+    runtime: tokio::runtime::Handle,
+    end_on_eof: bool,
+) {
     std::thread::Builder::new()
         .name("stdin".into())
         .spawn(move || {
@@ -75,7 +159,15 @@ pub fn spawn_stdin(handle: CoreHandle, pacer: Pacer, end_on_eof: bool) {
                     continue;
                 }
                 match parse_command(line) {
-                    Some(Ok(cmd)) => handle.command(cmd),
+                    Some(Ok(Typed::Command(cmd))) => handle.command(cmd),
+                    Some(Ok(Typed::Query(q))) => {
+                        // answer once what was said before has been handled
+                        pacer.wait_free();
+                        match runtime.block_on(answer(&memory, q)) {
+                            Ok(text) => eprintln!("{text}"),
+                            Err(e) => eprintln!("  ! {e:#}"),
+                        }
+                    }
                     Some(Err(help)) => eprintln!("{help}"),
                     None => {
                         if interactive && !pacer.is_free() {
@@ -105,6 +197,7 @@ pub async fn print_events(mut rx: broadcast::Receiver<Event>, echo_user: bool) {
             Err(broadcast::error::RecvError::Closed) => break,
         };
         match event {
+            Event::SessionStarted { session } => eprintln!("  · the rite opens (session #{session})"),
             Event::StateChanged { state, muted } => {
                 let s = match state {
                     State::Asleep => "she sleeps",
@@ -157,9 +250,19 @@ mod tests {
 
     #[test]
     fn parses_commands() {
-        assert_eq!(parse_command("/mute"), Some(Ok(Command::Mute { on: true })));
-        assert_eq!(parse_command("/timer  start"), Some(Ok(Command::TimerStart)));
-        assert_eq!(parse_command("/end"), Some(Ok(Command::EndSession)));
+        let cmd = |c| Some(Ok(Typed::Command(c)));
+        assert_eq!(parse_command("/mute"), cmd(Command::Mute { on: true }));
+        assert_eq!(parse_command("/timer  start"), cmd(Command::TimerStart));
+        assert_eq!(parse_command("/end"), cmd(Command::EndSession));
+        assert_eq!(parse_command("/kept"), cmd(Command::OathVerdict { kept: true }));
+        assert_eq!(parse_command("/forget 12"), cmd(Command::ForgetFact { id: 12 }));
+        assert_eq!(
+            parse_command("/mission Master Rust."),
+            cmd(Command::SetMission { text: "Master Rust.".into() })
+        );
+        assert_eq!(parse_command("/mission"), Some(Ok(Typed::Query(Query::Mission))));
+        assert_eq!(parse_command("/search storage slots"), Some(Ok(Typed::Query(Query::Search("storage slots".into())))));
+        assert!(matches!(parse_command("/forget x"), Some(Err(_))));
         assert!(matches!(parse_command("/nope"), Some(Err(_))));
         assert!(matches!(parse_command("/timer"), Some(Err(e)) if e.starts_with("usage: /timer")));
         assert_eq!(parse_command("talk to me"), None);

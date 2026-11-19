@@ -29,6 +29,8 @@ pub struct Config {
     pub mic_device: Option<String>,
     /// Silence that ends my turn.
     pub end_of_turn: std::time::Duration,
+    /// Her memory: the SQLite database file.
+    pub db_path: PathBuf,
 }
 
 impl Config {
@@ -70,6 +72,7 @@ impl Config {
                     .ok_or_else(|| anyhow::anyhow!("LLM_TEMPERATURE must be a number from 0 to 2, got {t:?}"))?,
             },
             mic_device: get("MIC_DEVICE"),
+            db_path: get("DB_PATH").unwrap_or("./lasthope.db".into()).into(),
             end_of_turn: match get("END_OF_TURN_MS") {
                 None => std::time::Duration::from_millis(1200),
                 Some(ms) => ms

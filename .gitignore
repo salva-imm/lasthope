@@ -15,3 +15,8 @@
 
 # LASTHOPE_DEBUG_AUDIO dumps
 /debug-audio
+
+# her memory (SQLite)
+*.db
+*.db-wal
+*.db-shm

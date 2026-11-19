@@ -9,7 +9,9 @@ mod core_loop;
 mod llm;
 mod memory;
 mod persona;
+mod rite;
 mod speech_out;
+mod streak;
 mod text_io;
 mod timer;
 
@@ -20,7 +22,8 @@ use anyhow::Result;
 
 use crate::audio_in::Gate;
 use crate::config::Config;
-use crate::core_loop::{Command, Core, Input};
+use crate::core_loop::{Core, Input};
+use crate::memory::Memory;
 use crate::llm::LlmClient;
 use crate::persona::Persona;
 use crate::speech_out::{Mouth, Voice};
@@ -33,7 +36,7 @@ usage: lasthope [--text | --mics]
   --mics   list microphones and show which one she will listen through
 
 settings (environment or .env): LLM_BASE_URL, LLM_API_KEY, LLM_MODEL
-optional: LLM_TEMPERATURE (0.8), PERSONA_PATH (./persona.md),
+optional: LLM_TEMPERATURE (0.8), PERSONA_PATH (./persona.md), DB_PATH (./lasthope.db),
           MIC_DEVICE (part of a mic name, or \"default\"), END_OF_TURN_MS (1200),
           KOKORO_DIR (./kokoro-multi-lang-v1_0), MODELS_DIR (./models)
 
@@ -60,6 +63,7 @@ async fn main() -> Result<()> {
     let cfg = Config::load()?;
     let llm = LlmClient::new(cfg.llm.clone())?;
     let persona = Persona::new(cfg.persona_path.clone(), cfg.temperature);
+    let memory = Memory::open(&cfg.db_path).await?;
     let (handle, inputs) = core_loop::channel();
     let gate = Gate::new(false);
     let pacer = core_loop::Pacer::default();
@@ -76,27 +80,38 @@ async fn main() -> Result<()> {
         Arc::new(voice)
     };
 
-    text_io::spawn_stdin(handle.clone(), pacer.clone(), text_mode);
+    text_io::spawn_stdin(
+        handle.clone(),
+        pacer.clone(),
+        memory.clone(),
+        tokio::runtime::Handle::current(),
+        text_mode,
+    );
     let echo_user = !text_mode || !text_io::stdin_is_terminal();
     let printer = tokio::spawn(text_io::print_events(handle.subscribe(), echo_user));
     {
         let h = handle.clone();
         tokio::spawn(async move {
+            // first Ctrl-C: close the session (summary included); second: quit now
             if tokio::signal::ctrl_c().await.is_ok() {
-                h.command(Command::EndSession);
+                eprintln!("  · closing (Ctrl-C again to quit at once)");
+                h.send(Input::Shutdown);
+            }
+            if tokio::signal::ctrl_c().await.is_ok() {
+                std::process::exit(130);
             }
         });
     }
 
     eprintln!(
-        "lasthope: {} mode, mind = {}, persona = {} — /help for commands, Ctrl-C to end",
+        "lasthope: {} mode, mind = {}, persona = {}, memory = {} — /help for commands",
         if text_mode { "text" } else { "voice" },
         llm.model(),
-        persona.path().display()
+        persona.path().display(),
+        cfg.db_path.display()
     );
 
-    let memory = Core::new(llm, persona, mouth, gate, pacer, handle, inputs).run().await;
+    Core::new(llm, persona, memory, mouth, gate, pacer, handle, inputs).run().await;
     let _ = tokio::time::timeout(Duration::from_secs(1), printer).await;
-    eprintln!("  · {} lines spoken this session", memory.transcript().len());
     Ok(())
 }

@@ -3,8 +3,8 @@
 A personal voice companion written in Rust. You speak, she listens, thinks and answers aloud.
 Hearing and speaking run locally; only the language model call goes to the cloud.
 
-> Work in progress. Phases 1-2 of 5 are done: the foundation, her character and
-> conversation. Persistent memory, the focus timer's voice and the web UI come next.
+> Work in progress. Phases 1-3 of 5 are done: the foundation, her character and
+> conversation, memory and sessions. The focus timer's voice and the web UI come next.
 
 ## How it works
 
@@ -40,8 +40,10 @@ src/
   audio_in.rs    mic -> VAD -> Whisper (and the mic gate)
   speech_out.rs  text -> phonemes -> Kokoro -> speaker, sentence chunking
   llm.rs         OpenAI-compatible client
-  persona.rs     loads persona.md, builds each request, cleans replies
-  memory.rs      session transcript and recent history (SQLite in phase 3)
+  persona.rs     loads persona.md, builds each request and its memory context, cleans replies
+  rite.rs        the shape of a session: greeting, oath verdict, oath, close (pure state machine)
+  streak.rs      days and the chain of seals (pure logic)
+  memory.rs      SQLite: sessions, messages (+ full-text search), facts, mission, streak
   timer.rs       the vigil (focus timer)
   text_io.rs     stdin/stdout mode, slash-commands, event printer
 ```
@@ -49,8 +51,10 @@ src/
 The core owns all state. Anything that drives it (voice, `--text`, later the web UI)
 sends `Command`s and watches `Event`s:
 
-- Commands: `mute`, `stop_speaking`, `sleep`, `end_session`, `timer_start`, `timer_pause`, `timer_reset`
-- Events: `state_changed`, `user_spoke`, `she_spoke`, `timer_tick`, `memory_changed`, `notice`, `error`, `session_ended`
+- Commands: `mute`, `stop_speaking`, `sleep`, `end_session`, `oath_verdict`, `set_mission`,
+  `forget_fact`, `timer_start`, `timer_pause`, `timer_reset`
+- Events: `session_started`, `state_changed`, `user_spoke`, `she_spoke`, `timer_tick`,
+  `memory_changed`, `notice`, `error`, `session_ended`
 
 ## Setup
 
@@ -106,6 +110,34 @@ immediately. HTML comments in it are notes and are not sent.
 Whatever the model returns, the code keeps her spoken: reasoning blocks,
 markdown and list markup are stripped, and a reply is cut to four sentences.
 
+### Memory and the rite
+
+Everything she knows lives in `lasthope.db`, a local SQLite file (gitignored, `DB_PATH` to move it).
+The Rust code owns it and writes what is relevant into every request; the model is never trusted
+to remember on its own.
+
+- **sessions**: start, end, summary, the oath sworn, its verdict, focused minutes
+- **messages**: every line, saved the moment it is said (a crash loses nothing), with FTS5
+  full-text search; lines from past sessions that match what you just said are recalled into the prompt
+- **facts**: what she has learned about you, each deletable
+- **state**: the great work (your mission) and the chain of seals (the streak)
+
+A session follows the rite:
+
+1. **She speaks first**: greets you using memory, asks what you did since last time and, if an oath
+   is due, whether you kept it or broke it.
+2. **Your verdict** ("kept" / "broken", or `/kept` `/broken`) is recorded, and the chain of seals is
+   updated from that answer and real dates only: consecutive kept days grow it, a broken oath or a
+   missed day resets it. Days run 4 am to 4 am, so a late-night session belongs to the evening before.
+3. You talk.
+4. **"Close the rite"**: she asks for tomorrow's oath, you swear it, she seals it. Saying it again
+   closes without an oath. Ctrl-C closes at once.
+5. **On close**, one LLM call writes a short summary and extracts new durable facts.
+
+A session left open by a crash is sealed (and summarized) on the next start; a summary that
+failed (e.g. rate limit) is retried then too. On first run the great work is: *Master Rust, EVM
+internals and networking, with at least twenty-five minutes of focused work every day.*
+
 ### Commands
 
 Type these in the terminal, in either mode:
@@ -115,8 +147,15 @@ Type these in the terminal, in either mode:
 /stop                        silence her: cut off the current reply
 /sleep /wake                 pause / resume listening
 /timer start|pause|reset     the vigil (25 min)
-/end                         end the session (also Ctrl-C)
+/kept  /broken               your verdict on the last oath
+/status                      the great work, the chain of seals, the oaths
+/facts   /forget N           what she knows of you; strike fact N out
+/mission [text]              show or rename the great work
+/search words                search everything ever said
+/end                         close the rite (asks tomorrow's oath; /end again skips it)
 ```
+
+Ctrl-C closes the session (summary included); a second Ctrl-C quits at once.
 
 ## Tests
 

@@ -2,6 +2,10 @@
 //! commands) and publishes `Event`s. Voice mode, text mode and (phase 5) the
 //! web UI all drive it through the same `CoreHandle`.
 //!
+//! A session follows the rite (see rite.rs): she greets and asks about the
+//! last oath, we talk, she asks for tomorrow's oath, and on close one LLM call
+//! writes the summary and new facts. Every line is saved as it is said.
+//!
 //! A reply is a "turn": Thinking (LLM request) -> Speaking (voice) -> Idle.
 //! Turns run as background tasks so commands (stop, mute, end) are handled
 //! immediately, even mid-reply. Results carry a turn id; stale ones are dropped.
@@ -18,11 +22,20 @@ use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
 
 use crate::audio_in::Gate;
-use crate::llm::LlmClient;
+use crate::llm::{ChatMessage, LlmClient};
 use crate::memory::{Memory, Speaker};
-use crate::persona::{self, Persona};
+use crate::persona::{self, Persona, Snapshot};
+use crate::rite::{Action, Rite, Situation};
 use crate::speech_out::Mouth;
 use crate::timer::{DEFAULT_VIGIL, Vigil};
+
+/// Facts sent with each request (the most recent ones).
+const MAX_FACTS_IN_PROMPT: usize = 40;
+/// Past lines recalled by full-text search for each reply.
+const RECALLED_LINES: u32 = 3;
+/// Transcript sent for the end-of-session summary (the tail, in characters).
+const SUMMARY_CHARS: usize = 12_000;
+const SUMMARY_TIMEOUT: Duration = Duration::from_secs(45);
 
 const WAV_PATH: &str = "output.wav";
 
@@ -44,7 +57,13 @@ pub enum Command {
     StopSpeaking,
     /// Pause listening; she finishes what she is saying.
     Sleep { on: bool },
+    /// Close the rite: she asks for tomorrow's oath first, a second request closes.
     EndSession,
+    /// My verdict on the last oath (the Kept / Broken buttons).
+    OathVerdict { kept: bool },
+    SetMission { text: String },
+    /// Strike a fact out of her memory.
+    ForgetFact { id: i64 },
     TimerStart,
     TimerPause,
     TimerReset,
@@ -53,12 +72,12 @@ pub enum Command {
 #[derive(Clone, Debug, Serialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum Event {
+    SessionStarted { session: i64 },
     StateChanged { state: State, muted: bool },
     UserSpoke { text: String },
     SheSpoke { text: String },
     TimerTick { remaining_secs: u64, total_secs: u64, running: bool },
-    /// Facts/mission/streak changed (phase 3).
-    #[allow(dead_code)]
+    /// Facts, mission, oath or streak changed: re-read them.
     MemoryChanged,
     Notice { text: String },
     Error { message: String },
@@ -71,6 +90,8 @@ pub enum Input {
     Command(Command),
     /// Text mode stdin closed: end the session once the current turn is done.
     EndOfInput,
+    /// Ctrl-C: close the session now (summary included, no oath question).
+    Shutdown,
 }
 
 /// Cheap, cloneable way to talk to the core and watch it.
@@ -101,10 +122,16 @@ impl CoreHandle {
 #[derive(Clone, Default)]
 pub struct Pacer(Arc<(Mutex<PacerState>, Condvar)>);
 
-#[derive(Default)]
 struct PacerState {
     busy: bool,
     pending: u64,
+}
+
+impl Default for PacerState {
+    /// Busy until the core has opened the session (she may speak first).
+    fn default() -> Self {
+        Self { busy: true, pending: 0 }
+    }
 }
 
 impl Pacer {
@@ -112,6 +139,15 @@ impl Pacer {
     pub fn is_free(&self) -> bool {
         let s = self.0.0.lock().unwrap();
         !s.busy && s.pending == 0
+    }
+
+    /// Block until she is free (without reserving anything).
+    pub fn wait_free(&self) {
+        let (lock, cvar) = &*self.0;
+        let mut s = lock.lock().unwrap();
+        while s.busy || s.pending > 0 {
+            s = cvar.wait(s).unwrap();
+        }
     }
 
     /// Block until she is free, then reserve the next line.
@@ -206,6 +242,8 @@ fn spoken_command(text: &str) -> Spoken {
 
 pub struct Core {
     llm: LlmClient,
+    persona: Persona,
+    memory: Memory,
     mouth: Arc<dyn Mouth>,
     gate: Gate,
     pacer: Pacer,
@@ -214,8 +252,9 @@ pub struct Core {
     inputs: mpsc::UnboundedReceiver<Input>,
     done_tx: mpsc::UnboundedSender<(u64, Done)>,
     done_rx: mpsc::UnboundedReceiver<(u64, Done)>,
-    memory: Memory,
-    persona: Persona,
+    /// This session's id (0 until opened).
+    session: i64,
+    rite: Rite,
     vigil: Vigil,
     muted: bool,
     asleep: bool,
@@ -224,13 +263,24 @@ pub struct Core {
     cancel: Option<Arc<AtomicBool>>,
     task: Option<JoinHandle<()>>,
     end_when_idle: bool,
+    /// Close the session once her current reply has been spoken.
+    close_after_reply: bool,
     published: Option<(State, bool)>,
+    /// What I said last, used to recall related lines from past sessions.
+    last_heard: String,
+    /// A reply the rite asked for while she was busy (e.g. "close" pressed
+    /// while she speaks); started as soon as her turn is over.
+    deferred: Option<Situation>,
+    /// What the reply in flight is about.
+    replying_to: Option<Situation>,
 }
 
 impl Core {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         llm: LlmClient,
         persona: Persona,
+        memory: Memory,
         mouth: Arc<dyn Mouth>,
         gate: Gate,
         pacer: Pacer,
@@ -240,6 +290,8 @@ impl Core {
         let (done_tx, done_rx) = mpsc::unbounded_channel();
         Self {
             llm,
+            persona,
+            memory,
             mouth,
             gate,
             pacer,
@@ -248,8 +300,8 @@ impl Core {
             inputs,
             done_tx,
             done_rx,
-            memory: Memory::default(),
-            persona,
+            session: 0,
+            rite: Rite::begin(None, false).0,
             vigil: Vigil::new(DEFAULT_VIGIL),
             muted: false,
             asleep: false,
@@ -258,31 +310,140 @@ impl Core {
             cancel: None,
             task: None,
             end_when_idle: false,
+            close_after_reply: false,
             published: None,
+            last_heard: String::new(),
+            deferred: None,
+            replying_to: None,
         }
     }
 
-    /// Run until the session ends. Returns what was said.
-    pub async fn run(mut self) -> Memory {
+    /// Run one session until it is closed.
+    pub async fn run(mut self) {
+        let mut flow = match self.open().await {
+            Ok(flow) => flow,
+            Err(e) => {
+                self.emit(Event::Error { message: format!("opening the session: {e:#}") });
+                Flow::Stop
+            }
+        };
         self.refresh();
         let mut tick = tokio::time::interval(Duration::from_secs(1));
         tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
-        loop {
-            let flow = tokio::select! {
+        while flow == Flow::Continue {
+            flow = tokio::select! {
                 input = self.inputs.recv() => match input {
-                    Some(input) => self.on_input(input),
+                    Some(input) => self.on_input(input).await,
                     None => Flow::Stop,
                 },
-                Some((id, done)) = self.done_rx.recv() => self.on_done(id, done),
+                Some((id, done)) = self.done_rx.recv() => self.on_done(id, done).await,
                 _ = tick.tick() => { self.on_tick(); Flow::Continue }
             };
+            if flow == Flow::Continue && self.turn == Turn::Idle {
+                if let Some(situation) = self.deferred.take() {
+                    self.start_reply(situation).await;
+                }
+            }
             self.refresh();
-            if flow == Flow::Stop || (self.end_when_idle && self.turn == Turn::Idle) {
-                break;
+            if self.end_when_idle && self.turn == Turn::Idle {
+                flow = Flow::Stop;
             }
         }
-        self.shutdown();
-        self.memory
+        self.close().await;
+    }
+
+    /// Seal any session a crash left open, start this one, and let the rite
+    /// decide whether she speaks first.
+    async fn open(&mut self) -> Result<Flow> {
+        for id in self.memory.unfinished_sessions(None).await? {
+            self.notice(format!("sealing an unfinished session (#{id})"));
+            let summary = self.summarize(id).await;
+            self.memory.finish_session(id, summary.as_deref(), true).await?;
+        }
+        // a summary that failed last time (network, rate limit) is retried
+        for id in self.memory.sessions_missing_summary(3).await? {
+            self.notice(format!("writing the missing account of session #{id}"));
+            if let Some(summary) = self.summarize(id).await {
+                self.memory.finish_session(id, Some(&summary), true).await?;
+            }
+        }
+        self.session = self.memory.start_session().await?;
+        self.emit(Event::SessionStarted { session: self.session });
+        let today = self.memory.today().await?;
+        let pending = self.memory.pending_oath(today, self.session).await?;
+        let speaks_first = self.memory.speaks_first().await?;
+        let (rite, actions) = Rite::begin(pending, speaks_first);
+        self.rite = rite;
+        Ok(self.apply(actions).await)
+    }
+
+    /// End the session: stop speaking, write the summary and new facts.
+    async fn close(&mut self) {
+        if let Some(c) = &self.cancel {
+            c.store(true, Ordering::Relaxed);
+        }
+        if let Some(t) = self.task.take() {
+            t.abort();
+        }
+        self.gate.set(false);
+        if self.session != 0 {
+            self.notice("she records the night");
+            let summary = self.summarize(self.session).await;
+            if let Err(e) = self.memory.finish_session(self.session, summary.as_deref(), false).await {
+                self.emit(Event::Error { message: format!("closing the session: {e:#}") });
+            }
+        }
+        self.pacer.update(u64::MAX, false); // release a waiting stdin reader
+        self.emit(Event::SessionEnded);
+    }
+
+    /// One LLM call: a short summary of `session` and new facts (stored here).
+    /// None if nothing was said or the call failed.
+    async fn summarize(&self, session: i64) -> Option<String> {
+        let lines = self.memory.session_lines(session).await.ok()?;
+        if !lines.iter().any(|l| l.speaker == Speaker::Me) {
+            return None;
+        }
+        // the tail of the transcript, within budget
+        let mut start = lines.len();
+        let mut chars = 0;
+        while start > 0 && chars + lines[start - 1].text.len() <= SUMMARY_CHARS {
+            chars += lines[start - 1].text.len();
+            start -= 1;
+        }
+        let known: Vec<String> =
+            self.memory.facts().await.unwrap_or_default().into_iter().map(|f| f.text).collect();
+        let mission = self.memory.mission().await.unwrap_or_default();
+        let request = persona::summary_messages(&lines[start..], &known, &mission);
+        let raw = match tokio::time::timeout(
+            SUMMARY_TIMEOUT,
+            self.llm.chat(&request, persona::SUMMARY_SAMPLING),
+        )
+        .await
+        {
+            Ok(Ok(raw)) => raw,
+            Ok(Err(e)) => {
+                self.emit(Event::Error { message: format!("summary: {e:#}") });
+                return None;
+            }
+            Err(_) => {
+                self.emit(Event::Error { message: "summary: timed out".into() });
+                return None;
+            }
+        };
+        let Some((summary, facts)) = persona::parse_summary(&raw) else {
+            self.emit(Event::Error { message: format!("summary: unreadable reply {raw:?}") });
+            return None;
+        };
+        match self.memory.add_facts(session, &facts).await {
+            Ok(0) => {}
+            Ok(n) => {
+                self.notice(format!("she learned {n} new thing{} about you", if n == 1 { "" } else { "s" }));
+                self.emit(Event::MemoryChanged);
+            }
+            Err(e) => self.emit(Event::Error { message: format!("saving facts: {e:#}") }),
+        }
+        Some(summary)
     }
 
     fn emit(&self, event: Event) {
@@ -291,6 +452,10 @@ impl Core {
 
     fn notice(&self, text: impl Into<String>) {
         self.emit(Event::Notice { text: text.into() });
+    }
+
+    fn error(&self, context: &str, e: anyhow::Error) {
+        self.emit(Event::Error { message: format!("{context}: {e:#}") });
     }
 
     fn state(&self) -> State {
@@ -314,19 +479,22 @@ impl Core {
         }
     }
 
-    fn on_input(&mut self, input: Input) -> Flow {
+    async fn on_input(&mut self, input: Input) -> Flow {
         match input {
             Input::Heard(text) => {
                 self.heard_since_refresh += 1;
-                return self.on_heard(text.trim());
+                self.on_heard(text.trim()).await
             }
-            Input::Command(cmd) => return self.on_command(cmd),
-            Input::EndOfInput => self.end_when_idle = true,
+            Input::Command(cmd) => self.on_command(cmd).await,
+            Input::EndOfInput => {
+                self.end_when_idle = true;
+                Flow::Continue
+            }
+            Input::Shutdown => Flow::Stop,
         }
-        Flow::Continue
     }
 
-    fn on_heard(&mut self, text: &str) -> Flow {
+    async fn on_heard(&mut self, text: &str) -> Flow {
         if text.is_empty() {
             return Flow::Continue;
         }
@@ -337,26 +505,61 @@ impl Core {
         }
         self.emit(Event::UserSpoke { text: text.to_string() });
         match spoken_command(text) {
-            Spoken::EndSession => return Flow::Stop,
-            Spoken::SaveWav(content) if content.is_empty() => {
-                self.notice("say the words to save after \"please say\"")
+            Spoken::EndSession => {
+                let actions = self.rite.close_requested();
+                self.apply(actions).await
             }
-            Spoken::SaveWav(content) => self.start_save(content),
+            Spoken::SaveWav(content) if content.is_empty() => {
+                self.notice("say the words to save after \"please say\"");
+                Flow::Continue
+            }
+            Spoken::SaveWav(content) => {
+                self.start_save(content);
+                Flow::Continue
+            }
             Spoken::Talk => {
-                self.memory.record(Speaker::Me, text);
-                self.start_reply();
+                if let Err(e) = self.memory.add_message(self.session, Speaker::Me, text).await {
+                    self.error("saving what you said", e);
+                }
+                self.last_heard = text.to_string();
+                let actions = self.rite.heard(text);
+                self.apply(actions).await
             }
         }
-        Flow::Continue
     }
 
-    fn on_command(&mut self, cmd: Command) -> Flow {
+    async fn on_command(&mut self, cmd: Command) -> Flow {
         let now = Instant::now();
         match cmd {
             Command::Mute { on } => self.muted = on,
             Command::Sleep { on } => self.asleep = on,
             Command::StopSpeaking => self.stop_turn(),
-            Command::EndSession => return Flow::Stop,
+            Command::EndSession => {
+                let actions = self.rite.close_requested();
+                return self.apply(actions).await;
+            }
+            Command::OathVerdict { kept } => {
+                let actions = self.rite.verdict_given(kept);
+                if actions.is_empty() {
+                    self.notice("no oath awaits a verdict");
+                }
+                return self.apply(actions).await;
+            }
+            Command::SetMission { text } => match self.memory.set_mission(text.trim()).await {
+                Ok(()) => {
+                    self.notice("the great work is renamed");
+                    self.emit(Event::MemoryChanged);
+                }
+                Err(e) => self.error("setting the mission", e),
+            },
+            Command::ForgetFact { id } => match self.memory.forget_fact(id).await {
+                Ok(true) => {
+                    self.notice(format!("fact {id} struck out"));
+                    self.emit(Event::MemoryChanged);
+                }
+                Ok(false) => self.notice(format!("no fact {id}")),
+                Err(e) => self.error("forgetting", e),
+            },
             Command::TimerStart => {
                 self.vigil.start(now);
                 self.emit_tick(now);
@@ -373,16 +576,55 @@ impl Core {
         Flow::Continue
     }
 
-    fn on_done(&mut self, id: u64, done: Done) -> Flow {
+    /// Carry out what the rite decided.
+    async fn apply(&mut self, actions: Vec<Action>) -> Flow {
+        for action in actions {
+            match action {
+                Action::Reply(situation) if self.turn != Turn::Idle => self.deferred = Some(situation),
+                Action::Reply(situation) => self.start_reply(situation).await,
+                Action::RecordVerdict { oath_session, kept } => {
+                    match self.memory.record_verdict(oath_session, kept).await {
+                        Ok(streak) => {
+                            let today = self.memory.today().await.ok();
+                            let chain = today.map(|t| streak.current(t)).unwrap_or(streak.count);
+                            self.notice(format!(
+                                "oath {} — the chain of seals: {chain}",
+                                if kept { "kept" } else { "broken" }
+                            ));
+                            self.emit(Event::MemoryChanged);
+                        }
+                        Err(e) => self.error("recording the verdict", e),
+                    }
+                }
+                Action::RecordOath(text) => match self.memory.set_oath(self.session, &text).await {
+                    Ok(day) => {
+                        self.notice(format!("oath sworn for {} {day}", day.weekday()));
+                        self.emit(Event::MemoryChanged);
+                    }
+                    Err(e) => self.error("recording the oath", e),
+                },
+                Action::CloseAfterReply => self.close_after_reply = true,
+                Action::Close => return Flow::Stop,
+            }
+        }
+        Flow::Continue
+    }
+
+    async fn on_done(&mut self, id: u64, done: Done) -> Flow {
         if id != self.turn_id || self.turn == Turn::Idle {
             return Flow::Continue; // a turn that was cancelled
         }
         self.task = None;
         match done {
             Done::Reply(Ok(raw)) => {
-                let text = persona::clean_reply(&raw);
+                let mut text = persona::clean_reply(&raw);
+                if let Some(situation) = self.replying_to.take() {
+                    text = persona::ensure_verdict_question(&situation, text);
+                }
                 if !text.is_empty() {
-                    self.memory.record(Speaker::Her, &text);
+                    if let Err(e) = self.memory.add_message(self.session, Speaker::Her, &text).await {
+                        self.error("saving her words", e);
+                    }
                     self.emit(Event::SheSpoke { text: text.clone() });
                     self.start_speaking(text);
                     return Flow::Continue;
@@ -397,7 +639,7 @@ impl Core {
         }
         self.turn = Turn::Idle;
         self.cancel = None;
-        Flow::Continue
+        if self.close_after_reply { Flow::Stop } else { Flow::Continue }
     }
 
     fn on_tick(&mut self) {
@@ -425,11 +667,46 @@ impl Core {
         self.turn_id
     }
 
-    /// Ask her to answer the conversation so far.
-    fn start_reply(&mut self) {
+    /// Gather what she needs to know from memory for this moment.
+    async fn prepare(&mut self, situation: &Situation) -> Result<Vec<ChatMessage>> {
+        let m = &self.memory;
+        let today = m.today().await?;
+        let mut facts: Vec<String> = m.facts().await?.into_iter().map(|f| f.text).collect();
+        facts.drain(..facts.len().saturating_sub(MAX_FACTS_IN_PROMPT));
+        let recalled = if *situation == Situation::Conversation && !self.last_heard.is_empty() {
+            m.search(&self.last_heard, RECALLED_LINES, Some(self.session)).await?
+        } else {
+            vec![]
+        };
+        let snapshot = Snapshot {
+            today: Some(today),
+            hour: m.local_hour().await?,
+            mission: m.mission().await?,
+            streak: m.streak().await?.current(today),
+            last_session: m.last_session(self.session).await?,
+            pending_oath: self.rite.pending().cloned(),
+            upcoming_oath: m.upcoming_oath(today).await?,
+            facts,
+            recalled,
+        };
+        let context = persona::context(&snapshot, situation);
+        let lines = m.session_lines(self.session).await?;
+        let history = persona::recent(&lines, persona::HISTORY_LINES, persona::HISTORY_CHARS);
+        Ok(self.persona.messages(&context, history, persona::stage_direction(situation)))
+    }
+
+    /// Ask her to speak, about `situation`.
+    async fn start_reply(&mut self, situation: Situation) {
         let id = self.next_turn(Turn::Thinking);
-        let history = self.memory.recent(persona::HISTORY_LINES, persona::HISTORY_CHARS);
-        let messages = self.persona.messages(history);
+        let messages = match self.prepare(&situation).await {
+            Ok(m) => m,
+            Err(e) => {
+                self.error("reading memory", e);
+                self.turn = Turn::Idle;
+                return;
+            }
+        };
+        self.replying_to = Some(situation);
         let sampling = self.persona.sampling();
         let llm = self.llm.clone();
         let tx = self.done_tx.clone();
@@ -486,18 +763,6 @@ impl Core {
             Turn::Saving | Turn::Idle => {}
         }
     }
-
-    fn shutdown(&mut self) {
-        if let Some(c) = &self.cancel {
-            c.store(true, Ordering::Relaxed);
-        }
-        if let Some(t) = self.task.take() {
-            t.abort();
-        }
-        self.gate.set(false);
-        self.pacer.update(u64::MAX, false); // release a waiting stdin reader
-        self.emit(Event::SessionEnded);
-    }
 }
 
 #[cfg(test)]
@@ -522,6 +787,10 @@ mod tests {
         assert_eq!(c, Command::Mute { on: true });
         let c: Command = serde_json::from_str(r#"{"cmd":"timer_start"}"#).unwrap();
         assert_eq!(c, Command::TimerStart);
+        let c: Command = serde_json::from_str(r#"{"cmd":"oath_verdict","kept":false}"#).unwrap();
+        assert_eq!(c, Command::OathVerdict { kept: false });
+        let c: Command = serde_json::from_str(r#"{"cmd":"forget_fact","id":3}"#).unwrap();
+        assert_eq!(c, Command::ForgetFact { id: 3 });
         let e = serde_json::to_string(&Event::StateChanged { state: State::Listening, muted: false }).unwrap();
         assert_eq!(e, r#"{"event":"state_changed","state":"listening","muted":false}"#);
     }
