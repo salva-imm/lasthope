@@ -31,6 +31,10 @@ pub struct Config {
     pub end_of_turn: std::time::Duration,
     /// Her memory: the SQLite database file.
     pub db_path: PathBuf,
+    /// The web UI: address and port to listen on, and where its files are.
+    pub ui_bind: std::net::IpAddr,
+    pub ui_port: u16,
+    pub ui_dir: PathBuf,
 }
 
 impl Config {
@@ -72,6 +76,17 @@ impl Config {
                     .ok_or_else(|| anyhow::anyhow!("LLM_TEMPERATURE must be a number from 0 to 2, got {t:?}"))?,
             },
             mic_device: get("MIC_DEVICE"),
+            ui_bind: match get("UI_BIND") {
+                None => std::net::Ipv4Addr::LOCALHOST.into(),
+                Some(a) => a
+                    .parse()
+                    .map_err(|_| anyhow::anyhow!("UI_BIND must be an IP address (127.0.0.1, 0.0.0.0, …), got {a:?}"))?,
+            },
+            ui_port: match get("UI_PORT") {
+                None => 7700,
+                Some(p) => p.parse().map_err(|_| anyhow::anyhow!("UI_PORT must be a port number, got {p:?}"))?,
+            },
+            ui_dir: get("UI_DIR").unwrap_or("./ui".into()).into(),
             db_path: get("DB_PATH").unwrap_or("./lasthope.db".into()).into(),
             end_of_turn: match get("END_OF_TURN_MS") {
                 None => std::time::Duration::from_millis(1200),

@@ -14,6 +14,7 @@ mod speech_out;
 mod streak;
 mod text_io;
 mod timer;
+mod web;
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -29,16 +30,18 @@ use crate::persona::Persona;
 use crate::speech_out::{Mouth, Voice};
 
 const USAGE: &str = "\
-usage: lasthope [--text | --mics]
+usage: lasthope [--text] [--no-ui] | --mics
 
   --text   type instead of speaking: stdin replaces the mic, stdout the speaker
            (no speech models are loaded)
+  --no-ui  no web UI; the program ends when the rite closes
   --mics   list microphones and show which one she will listen through
 
 settings (environment or .env): LLM_BASE_URL, LLM_API_KEY, LLM_MODEL
 optional: LLM_TEMPERATURE (0.8), PERSONA_PATH (./persona.md), DB_PATH (./lasthope.db),
           MIC_DEVICE (part of a mic name, or \"default\"), END_OF_TURN_MS (1200),
-          KOKORO_DIR (./kokoro-multi-lang-v1_0), MODELS_DIR (./models)
+          KOKORO_DIR (./kokoro-multi-lang-v1_0), MODELS_DIR (./models),
+          UI_BIND (127.0.0.1; 0.0.0.0 lets your phone in, with a key), UI_PORT (7700), UI_DIR (./ui)
 
 spoken commands: \"close the rite\" / \"end the session\" ends the session,
                  \"begin / pause / reset the vigil\" drives the focus timer,
@@ -56,10 +59,11 @@ async fn main() -> Result<()> {
         println!("{}", audio_in::describe_mics(pref.as_deref())?);
         return Ok(());
     }
-    if let Some(bad) = args.iter().find(|a| *a != "--text") {
+    if let Some(bad) = args.iter().find(|a| *a != "--text" && *a != "--no-ui") {
         anyhow::bail!("unknown argument {bad:?}\n\n{USAGE}");
     }
     let text_mode = args.iter().any(|a| a == "--text");
+    let want_ui = !args.iter().any(|a| a == "--no-ui");
 
     let cfg = Config::load()?;
     let llm = LlmClient::new(cfg.llm.clone())?;
@@ -112,7 +116,24 @@ async fn main() -> Result<()> {
         cfg.db_path.display()
     );
 
-    Core::new(llm, persona, memory, mouth, gate, pacer, handle, inputs).run().await;
+    // the web UI; while it is up, closing the rite does not end the program
+    let ui_up = want_ui && {
+        let mode = if text_mode { "text" } else { "voice" };
+        match web::start(cfg.ui_bind, cfg.ui_port, cfg.ui_dir.clone(), handle.clone(), memory.clone(), mode).await {
+            Ok(links) => {
+                for link in links {
+                    eprintln!("chamber: {link}");
+                }
+                true
+            }
+            Err(e) => {
+                eprintln!("  ! no web UI: {e:#}");
+                false
+            }
+        }
+    };
+
+    Core::new(llm, persona, memory, mouth, gate, pacer, handle, inputs).run(ui_up).await;
     let _ = tokio::time::timeout(Duration::from_secs(1), printer).await;
     Ok(())
 }

@@ -29,6 +29,7 @@ commands:
   /mission [text]         show or rename the great work
   /search words           search everything ever said
   /end                    close the rite (she asks tomorrow's oath; /end again skips it)
+  /open                   open the next rite (when the web UI keeps her running)
   /help";
 
 /// Text mode "voice": the reply is already printed from the SheSpoke event.
@@ -75,6 +76,7 @@ fn parse_command(line: &str) -> Option<Result<Typed, String>> {
         ("sleep" | "slumber", "") => cmd(Command::Sleep { on: true }),
         ("wake", "") => cmd(Command::Sleep { on: false }),
         ("end" | "quit" | "close", "") => cmd(Command::EndSession),
+        ("open", "") => cmd(Command::OpenRite),
         ("timer", "pause") | ("hold", "") => cmd(Command::TimerPause),
         ("timer", "reset") | ("anew", "") => cmd(Command::TimerReset),
         ("timer", t) | ("begin", t) if head == "begin" || t.starts_with("start") => {
@@ -225,6 +227,7 @@ pub async fn print_events(mut rx: broadcast::Receiver<Event>, echo_user: bool) {
             Event::SessionStarted { session } => eprintln!("  · the rite opens (session #{session})"),
             Event::StateChanged { state, muted } => {
                 let s = match state {
+                    State::Closed => continue, // "the rite is closed" is printed on SessionEnded
                     State::Asleep => "she sleeps",
                     State::Listening => "she listens",
                     State::Thinking => "she ponders",
@@ -256,10 +259,8 @@ pub async fn print_events(mut rx: broadcast::Receiver<Event>, echo_user: bool) {
             Event::MemoryChanged => {}
             Event::Notice { text } => eprintln!("  · {text}"),
             Event::Error { message } => eprintln!("  ! {message}"),
-            Event::SessionEnded => {
-                eprintln!("  · the rite is closed");
-                break;
-            }
+            Event::SessionEnded => eprintln!("  · the rite is closed"),
+            Event::Goodbye => break,
         }
         let _ = std::io::stdout().flush();
     }

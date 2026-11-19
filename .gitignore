@@ -20,3 +20,6 @@
 *.db
 *.db-wal
 *.db-shm
+
+# the seal artwork (yours; the UI falls back to a dark circle)
+/ui/assets/

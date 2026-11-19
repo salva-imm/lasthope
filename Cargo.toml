@@ -10,7 +10,9 @@ sherpa-onnx = "2.0.1"
 loqui-g2p = "0.4.0"
 rodio = { version = "0.23.0", default-features = false, features = ["playback", "recording"] }
 
-tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "sync", "time", "signal"] }
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "sync", "time", "signal", "net", "fs"] }
+# the local web UI: static files, a small JSON API and a WebSocket for events
+axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "query", "tokio", "ws"] }
 # native-tls = macOS Security.framework: no C/cmake build (the default rustls pulls aws-lc-sys)
 reqwest = { version = "0.13.5", default-features = false, features = ["json", "native-tls", "http2"] }
 serde = { version = "1.0.229", features = ["derive"] }

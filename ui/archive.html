@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#070506">
+<title>Lasthope · Archive</title>
+<link rel="stylesheet" href="app.css">
+</head>
+<body class="archive">
+<div class="page">
+
+<header class="top">
+  <div class="top-row">
+    <div class="brand-row">
+      <span class="brand">LASTHOPE</span>
+      <nav class="nav" aria-label="Sections">
+        <a href="/">Chamber</a>
+        <a href="/archive" aria-current="page">Archive</a>
+      </nav>
+    </div>
+    <span class="meta">Kept on this machine, and nowhere else <span class="conn" id="conn" hidden>· Lost: reconnecting</span></span>
+  </div>
+  <div class="checker" aria-hidden="true"></div>
+</header>
+
+<div class="columns">
+
+<aside class="side">
+  <div class="field search">
+    <label for="search">Search what was spoken</label>
+    <input id="search" type="search" placeholder="a word, an oath, a night" autocomplete="off">
+  </div>
+  <div class="hits" id="hits" hidden></div>
+  <h2 class="h" style="margin-top: 8px">The nights</h2>
+  <div id="nights" style="display: flex; flex-direction: column; gap: 16px"></div>
+</aside>
+
+<main class="main" id="night" aria-live="polite">
+  <section class="card account">
+    <p class="empty" style="margin: 0">No night is chosen.</p>
+  </section>
+</main>
+
+</div>
+</div>
+<script src="common.js"></script>
+<script src="archive.js"></script>
+</body>
+</html>

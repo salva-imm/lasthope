@@ -3,8 +3,9 @@
 A personal voice companion written in Rust. You speak, she listens, thinks and answers aloud.
 Hearing and speaking run locally; only the language model call goes to the cloud.
 
-> Work in progress. Phases 1-4 of 5 are done: the foundation, her character and
-> conversation, memory and sessions, the vigil. The web UI comes next.
+> All five phases are built: the foundation, her character and conversation, memory and
+> sessions, the vigil, and the web UI. Still to come: an LLM fallback chain, all-day
+> listening, and answering only your voice.
 
 ## How it works
 
@@ -46,16 +47,24 @@ src/
   memory.rs      SQLite: sessions, messages (+ full-text search), facts, mission, streak
   timer.rs       the vigil (focus timer) and the spoken words for it
   text_io.rs     stdin/stdout mode, slash-commands, event printer
+  web.rs         the web UI server: files, JSON API, WebSocket, who may come in
+ui/
+  index.html     the Chamber        archive.html   the Archive
+  app.css        the look (colours, fonts, the seal's motion)
+  common.js      connection and helpers; chamber.js, archive.js: the two pages
+  fonts/         Cinzel, IM Fell English, JetBrains Mono (SIL OFL, see OFL.txt)
+  assets/        seal.png, your artwork (gitignored; a dark circle stands in without it)
 ```
 
 The core owns all state. Anything that drives it (voice, `--text`, later the web UI)
 sends `Command`s and watches `Event`s:
 
-- Commands: `mute`, `stop_speaking`, `sleep`, `end_session`, `oath_verdict`, `set_mission`,
-  `forget_fact`, `timer_start` (optional `minutes`), `timer_pause`, `timer_reset`,
-  `log_vigil` (`minutes`, optional `yesterday`)
+- Commands: `mute`, `stop_speaking`, `sleep`, `end_session`, `open_rite`, `oath_verdict`,
+  `set_mission`, `forget_fact`, `timer_start` (optional `minutes`), `timer_pause`, `timer_reset`,
+  `log_vigil` (`minutes`, optional `yesterday`), `set_voice` (`voice`, `pace`), `set_speaks_first`,
+  `read_aloud` (`session`), `burn_session` (`session`)
 - Events: `session_started`, `state_changed`, `user_spoke`, `she_spoke`, `timer_tick`,
-  `memory_changed`, `notice`, `error`, `session_ended`
+  `memory_changed`, `notice`, `error`, `session_ended`, `goodbye`
 
 ## Setup
 
@@ -78,8 +87,9 @@ sends `Command`s and watches `Event`s:
 ## Run
 
 ```bash
-cargo run --release            # voice: speak into the mic
+cargo run --release            # voice: speak into the mic; the web UI at http://localhost:7700
 cargo run --release -- --text  # type instead: stdin replaces the mic, stdout the speaker
+cargo run --release -- --no-ui # no web UI: the program ends when the rite closes
 cargo run --release -- --mics  # list microphones and show which one she will use
 ```
 
@@ -166,6 +176,31 @@ vigil resumes where it stopped.
   `/vigil yesterday 40` do the same by command.
 - She knows today's total and the running vigil, so she can hold you to the mission.
 
+### The web UI
+
+Open **http://localhost:7700** while she runs. Plain HTML, CSS and JavaScript served from
+`ui/` (no framework, no build step: edit a file and reload).
+
+- **Chamber**: her seal (it breathes while she listens, quickens when she speaks, dims while
+  she sleeps), her last words and the live transcript, Deafen / Silence / Slumber /
+  Close (or Open) the rite, the vigil with its length, a field to speak to her in writing,
+  the great work (renamable), the seven seals of the chain, the due oath with Kept / Broken,
+  what she knows of you (strike out a fact with two presses), and her nature: voice
+  (Kokoro's English voices), pace of speech, whether she speaks first.
+- **Archive**: every night (NOX I, II, …) with its account, what was sworn, what she learned
+  and every word; full-text search over all of it; *Hear it spoken* (she reads the account
+  aloud), *Copy it out*, and *Burn this night* (two presses: deletes its words and the facts
+  learned in it; the minutes of focused work and the chain of seals are kept).
+- While the UI is up, closing the rite does not end the program: the Chamber offers
+  **Open the rite** for the next session (or type `/open`). Ctrl-C quits.
+- "She answers only my voice" is shown but not built yet.
+
+**Your phone:** set `UI_BIND=0.0.0.0`. At startup she prints a second link,
+`http://<your-mac's-ip>:7700/?key=…`; open it once on the phone (the key is then kept in a
+cookie; bookmark the page). Without the key other devices are refused. The key is made once
+and kept in the database. Whatever the setting, other websites open in your browser cannot
+reach her: requests with a foreign origin, or a foreign host name, are refused.
+
 ### Commands
 
 Type these in the terminal, in either mode:
@@ -182,6 +217,7 @@ Type these in the terminal, in either mode:
 /mission [text]              show or rename the great work
 /search words                search everything ever said
 /end                         close the rite (asks tomorrow's oath; /end again skips it)
+/open                        open the next rite (while the web UI keeps her running)
 ```
 
 Ctrl-C closes the session (summary included); a second Ctrl-C quits at once.

@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
 
@@ -46,6 +46,8 @@ const SAME_VIGIL_WINDOW: Duration = Duration::from_secs(30 * 60);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum State {
+    /// No session: the rite is closed (the web UI can open the next one).
+    Closed,
     Asleep,
     Listening,
     Thinking,
@@ -68,6 +70,15 @@ pub enum Command {
     SetMission { text: String },
     /// Strike a fact out of her memory.
     ForgetFact { id: i64 },
+    /// Open the next session once the rite has been closed (the web UI).
+    OpenRite,
+    /// Her voice (a Kokoro speaker id) and pace in percent (70-130).
+    SetVoice { voice: i32, pace: u32 },
+    SetSpeaksFirst { on: bool },
+    /// Speak a past session's account aloud.
+    ReadAloud { session: i64 },
+    /// Delete a past session: its words and what she learned in it.
+    BurnSession { session: i64 },
     /// Begin a vigil (of `minutes`, default 25) or resume a paused one.
     TimerStart {
         #[serde(default)]
@@ -96,6 +107,25 @@ pub enum Event {
     Notice { text: String },
     Error { message: String },
     SessionEnded,
+    /// The program is ending.
+    Goodbye,
+}
+
+/// What the core is doing right now, for anyone who joins late (the web UI).
+#[derive(Clone, Debug, Serialize)]
+pub struct Live {
+    pub state: State,
+    pub muted: bool,
+    /// The open session, if any.
+    pub session: Option<i64>,
+    pub vigil: VigilStatus,
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+pub struct VigilStatus {
+    pub remaining_secs: u64,
+    pub total_secs: u64,
+    pub running: bool,
 }
 
 #[derive(Debug)]
@@ -113,6 +143,7 @@ pub enum Input {
 pub struct CoreHandle {
     input: mpsc::UnboundedSender<Input>,
     events: broadcast::Sender<Event>,
+    live: Arc<watch::Sender<Live>>,
 }
 
 impl CoreHandle {
@@ -126,6 +157,10 @@ impl CoreHandle {
 
     pub fn subscribe(&self) -> broadcast::Receiver<Event> {
         self.events.subscribe()
+    }
+
+    pub fn live(&self) -> Live {
+        self.live.borrow().clone()
     }
 }
 
@@ -186,7 +221,14 @@ impl Pacer {
 pub fn channel() -> (CoreHandle, mpsc::UnboundedReceiver<Input>) {
     let (input, rx) = mpsc::unbounded_channel();
     let (events, _) = broadcast::channel(256);
-    (CoreHandle { input, events }, rx)
+    let total = DEFAULT_VIGIL.as_secs();
+    let live = watch::Sender::new(Live {
+        state: State::Closed,
+        muted: false,
+        session: None,
+        vigil: VigilStatus { remaining_secs: total, total_secs: total, running: false },
+    });
+    (CoreHandle { input, events, live: Arc::new(live) }, rx)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -205,10 +247,13 @@ enum Done {
     Saved(Result<()>),
 }
 
-#[derive(PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum Flow {
     Continue,
-    Stop,
+    /// The rite is closed: end this session.
+    Close,
+    /// End the session and the program (Ctrl-C, end of typed input).
+    Quit,
 }
 
 /// Everything heard goes to her, except these spoken commands.
@@ -345,23 +390,45 @@ impl Core {
         }
     }
 
-    /// Run one session until it is closed.
-    pub async fn run(mut self) {
+    /// Run sessions. Without `stay_up` the program ends with the first
+    /// session; with it (the web UI is up) the core then waits, rite closed,
+    /// for the next `OpenRite`.
+    pub async fn run(mut self, stay_up: bool) {
+        self.load_settings().await;
+        let mut tick = tokio::time::interval(Duration::from_secs(1));
+        tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        loop {
+            let flow = self.session(&mut tick).await;
+            if flow == Flow::Quit || !stay_up || !self.wait_for_rite(&mut tick).await {
+                break;
+            }
+        }
+        let now = Instant::now();
+        if !self.vigil.elapsed(now).is_zero() && !self.vigil.remaining(now).is_zero() {
+            self.notice(format!(
+                "the vigil is left unfinished ({} of {} min); unfinished vigils are not counted",
+                self.vigil.elapsed(now).as_secs() / 60,
+                self.vigil.total().as_secs() / 60
+            ));
+        }
+        self.emit(Event::Goodbye);
+    }
+
+    /// One session, from opening to the sealed account.
+    async fn session(&mut self, tick: &mut tokio::time::Interval) -> Flow {
         let mut flow = match self.open().await {
             Ok(flow) => flow,
             Err(e) => {
                 self.emit(Event::Error { message: format!("opening the session: {e:#}") });
-                Flow::Stop
+                Flow::Quit
             }
         };
         self.refresh();
-        let mut tick = tokio::time::interval(Duration::from_secs(1));
-        tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
         while flow == Flow::Continue {
             flow = tokio::select! {
                 input = self.inputs.recv() => match input {
                     Some(input) => self.on_input(input).await,
-                    None => Flow::Stop,
+                    None => Flow::Quit,
                 },
                 Some((id, done)) = self.done_rx.recv() => self.on_done(id, done).await,
                 _ = tick.tick() => { self.on_tick().await; Flow::Continue }
@@ -373,10 +440,43 @@ impl Core {
             }
             self.refresh();
             if self.end_when_idle && self.turn == Turn::Idle {
-                flow = Flow::Stop;
+                flow = Flow::Quit;
             }
         }
         self.close().await;
+        self.refresh();
+        flow
+    }
+
+    /// The rite is closed: the timer still runs and settings still change,
+    /// but nothing is heard until `OpenRite`. False: quit instead.
+    async fn wait_for_rite(&mut self, tick: &mut tokio::time::Interval) -> bool {
+        loop {
+            tokio::select! {
+                input = self.inputs.recv() => match input {
+                    None | Some(Input::Shutdown | Input::EndOfInput) => return false,
+                    Some(Input::Command(Command::OpenRite)) => return true,
+                    Some(Input::Command(cmd)) => { self.on_command(cmd).await; }
+                    Some(Input::Heard(text)) => {
+                        self.heard_since_refresh += 1;
+                        self.notice(format!("the rite is closed; unheard: {text}"));
+                    }
+                },
+                Some((id, done)) = self.done_rx.recv() => { self.on_done(id, done).await; }
+                _ = tick.tick() => self.on_tick().await,
+            }
+            self.refresh();
+        }
+    }
+
+    /// Her voice and pace, as last chosen.
+    async fn load_settings(&mut self) {
+        let voice = self.memory.setting("voice").await.ok().flatten().and_then(|v| v.parse().ok());
+        let speed = self.memory.setting("speed").await.ok().flatten().and_then(|v| v.parse().ok());
+        self.mouth.set_voice(
+            voice.unwrap_or(crate::speech_out::DEFAULT_VOICE),
+            speed.unwrap_or(crate::speech_out::DEFAULT_SPEED),
+        );
     }
 
     /// Seal any session a crash left open, start this one, and let the rite
@@ -394,6 +494,10 @@ impl Core {
                 self.memory.finish_session(id, Some(&summary), true).await?;
             }
         }
+        self.close_after_reply = false;
+        self.deferred.clear();
+        self.replying_to = None;
+        self.last_heard.clear();
         self.session = self.memory.start_session().await?;
         self.emit(Event::SessionStarted { session: self.session });
         let today = self.memory.today().await?;
@@ -413,14 +517,10 @@ impl Core {
             t.abort();
         }
         self.gate.set(false);
-        let now = Instant::now();
-        if !self.vigil.elapsed(now).is_zero() && !self.vigil.remaining(now).is_zero() {
-            self.notice(format!(
-                "the vigil is left unfinished ({} of {} min); unfinished vigils are not counted",
-                self.vigil.elapsed(now).as_secs() / 60,
-                self.vigil.total().as_secs() / 60
-            ));
-        }
+        self.turn = Turn::Idle;
+        self.cancel = None;
+        self.close_after_reply = false;
+        self.deferred.clear();
         if self.session != 0 {
             self.notice("she records the night");
             let summary = self.summarize(self.session).await;
@@ -428,6 +528,8 @@ impl Core {
                 self.emit(Event::Error { message: format!("closing the session: {e:#}") });
             }
         }
+        self.session = 0;
+        self.rite = Rite::begin(None, false).0;
         self.pacer.update(u64::MAX, false); // release a waiting stdin reader
         self.emit(Event::SessionEnded);
     }
@@ -497,6 +599,7 @@ impl Core {
         match self.turn {
             Turn::Speaking => State::Speaking,
             Turn::Thinking | Turn::Saving => State::Thinking,
+            Turn::Idle if self.session == 0 => State::Closed,
             Turn::Idle if self.asleep => State::Asleep,
             Turn::Idle => State::Listening,
         }
@@ -505,13 +608,19 @@ impl Core {
     /// Open the mic only when she is idle, awake and not deafened, and publish
     /// state changes.
     fn refresh(&mut self) {
-        self.gate.set(self.turn == Turn::Idle && !self.asleep && !self.muted);
+        self.gate.set(self.turn == Turn::Idle && !self.asleep && !self.muted && self.session != 0);
         self.pacer.update(std::mem::take(&mut self.heard_since_refresh), self.turn != Turn::Idle);
         let now = (self.state(), self.muted);
         if self.published != Some(now) {
             self.published = Some(now);
             self.emit(Event::StateChanged { state: now.0, muted: now.1 });
         }
+        let session = (self.session != 0).then_some(self.session);
+        self.handle.live.send_if_modified(|live| {
+            let changed = live.state != now.0 || live.muted != now.1 || live.session != session;
+            (live.state, live.muted, live.session) = (now.0, now.1, session);
+            changed
+        });
     }
 
     async fn on_input(&mut self, input: Input) -> Flow {
@@ -525,7 +634,7 @@ impl Core {
                 self.end_when_idle = true;
                 Flow::Continue
             }
-            Input::Shutdown => Flow::Stop,
+            Input::Shutdown => Flow::Quit,
         }
     }
 
@@ -610,6 +719,17 @@ impl Core {
             Command::TimerStart { minutes } => self.vigil_cmd(VigilCmd::Start { minutes }, false),
             Command::TimerPause => self.vigil_cmd(VigilCmd::Pause, false),
             Command::TimerReset => self.vigil_cmd(VigilCmd::Reset, false),
+            Command::OpenRite => self.notice("the rite is already open"),
+            Command::SetVoice { voice, pace } => self.set_voice(voice, pace).await,
+            Command::SetSpeaksFirst { on } => match self.memory.set_speaks_first(on).await {
+                Ok(()) => {
+                    self.notice(if on { "she will speak first" } else { "she will wait for you to speak" });
+                    self.emit(Event::MemoryChanged);
+                }
+                Err(e) => self.error("saving the setting", e),
+            },
+            Command::ReadAloud { session } => self.read_aloud(session).await,
+            Command::BurnSession { session } => self.burn(session).await,
             Command::LogVigil { minutes, yesterday } => {
                 if (1..=MAX_MINUTES).contains(&minutes) {
                     self.log_vigil(minutes, yesterday).await;
@@ -619,6 +739,57 @@ impl Core {
             }
         }
         Flow::Continue
+    }
+
+    async fn set_voice(&mut self, voice: i32, pace: u32) {
+        let Some((_, name)) = crate::speech_out::VOICES.iter().find(|(id, _)| *id == voice) else {
+            self.notice(format!("no voice {voice}"));
+            return;
+        };
+        let speed = pace.clamp(70, 130) as f32 / 100.0;
+        self.mouth.set_voice(voice, speed);
+        let saved = async {
+            self.memory.set_setting("voice", &voice.to_string()).await?;
+            self.memory.set_setting("speed", &format!("{speed:.2}")).await
+        };
+        if let Err(e) = saved.await {
+            self.error("saving her voice", e);
+        }
+        self.notice(format!("her voice: {name}, pace {speed:.2}"));
+        self.emit(Event::MemoryChanged);
+        if self.turn == Turn::Idle {
+            self.speak_line("So I will sound.".into());
+        }
+    }
+
+    async fn read_aloud(&mut self, session: i64) {
+        if self.turn != Turn::Idle {
+            self.notice("she is not done speaking");
+            return;
+        }
+        match self.memory.session_info(session).await {
+            Ok(Some(info)) => match info.summary {
+                Some(summary) => self.speak_line(summary),
+                None => self.notice("that night has no account"),
+            },
+            Ok(None) => self.notice(format!("no night {session}")),
+            Err(e) => self.error("reading the archive", e),
+        }
+    }
+
+    async fn burn(&mut self, session: i64) {
+        if session == self.session {
+            self.notice("the open rite cannot be burned; close it first");
+            return;
+        }
+        match self.memory.delete_session(session).await {
+            Ok(true) => {
+                self.notice(format!("night {session} is burned"));
+                self.emit(Event::MemoryChanged);
+            }
+            Ok(false) => self.notice(format!("no night {session}")),
+            Err(e) => self.error("burning the night", e),
+        }
     }
 
     /// Start, pause or reset the vigil. Spoken commands get a spoken answer;
@@ -673,6 +844,13 @@ impl Core {
         match self.record_vigil(minutes, false, VigilSource::Timer).await {
             Ok(total) => self.notice(format!("the vigil is complete: {minutes} min recorded, {total} min today")),
             Err(e) => self.error("recording the vigil", e),
+        }
+        if self.session == 0 {
+            // no rite to speak in: the bell alone
+            if self.turn == Turn::Idle {
+                self.speak_line("The vigil is complete.".into());
+            }
+            return;
         }
         if self.close_after_reply || self.rite.closing() {
             return;
@@ -748,7 +926,7 @@ impl Core {
                     Err(e) => self.error("recording the oath", e),
                 },
                 Action::CloseAfterReply => self.close_after_reply = true,
-                Action::Close => return Flow::Stop,
+                Action::Close => return Flow::Close,
             }
         }
         Flow::Continue
@@ -802,7 +980,7 @@ impl Core {
         }
         self.turn = Turn::Idle;
         self.cancel = None;
-        if self.close_after_reply { Flow::Stop } else { Flow::Continue }
+        if self.close_after_reply { Flow::Close } else { Flow::Continue }
     }
 
     async fn on_tick(&mut self) {
@@ -817,10 +995,16 @@ impl Core {
     }
 
     fn emit_tick(&self, now: Instant) {
-        self.emit(Event::TimerTick {
+        let v = VigilStatus {
             remaining_secs: self.vigil.remaining(now).as_secs_f64().ceil() as u64,
             total_secs: self.vigil.total().as_secs(),
             running: self.vigil.running(),
+        };
+        self.handle.live.send_replace(Live { vigil: v, ..self.handle.live() });
+        self.emit(Event::TimerTick {
+            remaining_secs: v.remaining_secs,
+            total_secs: v.total_secs,
+            running: v.running,
         });
     }
 

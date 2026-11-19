@@ -8,6 +8,7 @@
 //! - vigils: focused work, timed by the vigil or reported by me, by day
 //! - facts: what she has learned about me, each deletable
 //! - state: the mission and the streak
+//! - settings: small key/value preferences (her voice and pace, the UI key)
 //!
 //! "Today" is my local day with a 4 am boundary: a session at 00:30 still
 //! belongs to the evening before.
@@ -83,6 +84,11 @@ CREATE TABLE IF NOT EXISTS facts (
     session_id INTEGER REFERENCES sessions(id) ON DELETE SET NULL
 );
 
+CREATE TABLE IF NOT EXISTS settings (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS state (
     id           INTEGER PRIMARY KEY CHECK (id = 1),
     mission      TEXT NOT NULL,
@@ -112,12 +118,28 @@ impl Speaker {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct Line {
     pub speaker: Speaker,
     pub text: String,
     /// Local time, "YYYY-MM-DD HH:MM:SS".
     pub at: String,
+}
+
+/// One session as the archive lists it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct SessionInfo {
+    pub id: i64,
+    pub day: String,
+    pub started_at: String,
+    pub ended_at: Option<String>,
+    pub summary: Option<String>,
+    /// The oath sworn in this session (for the next day) and my verdict on it.
+    pub oath: Option<String>,
+    pub oath_day: Option<String>,
+    pub oath_kept: Option<bool>,
+    /// Focused work recorded during this session (timed or reported).
+    pub focused_minutes: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -396,10 +418,11 @@ impl Memory {
     // --- vigils -----------------------------------------------------------
 
     /// Record focused work on `day`. Timed vigils also count on the session.
+    /// `session` 0: between sessions (the rite is closed).
     pub async fn add_vigil(&self, session: i64, day: Day, minutes: u32, source: VigilSource) -> Result<()> {
         let mut tx = self.pool.begin().await?;
         sqlx::query("INSERT INTO vigils (session_id, day, minutes, source) VALUES (?1, ?2, ?3, ?4)")
-            .bind(session)
+            .bind((session != 0).then_some(session))
             .bind(day.to_string())
             .bind(minutes)
             .bind(match source {
@@ -443,6 +466,74 @@ impl Memory {
         Ok(sqlx::query_scalar("SELECT speaks_first FROM state WHERE id = 1").fetch_one(&self.pool).await?)
     }
 
+    pub async fn set_speaks_first(&self, on: bool) -> Result<()> {
+        sqlx::query("UPDATE state SET speaks_first = ?1 WHERE id = 1").bind(on).execute(&self.pool).await?;
+        Ok(())
+    }
+
+    pub async fn setting(&self, key: &str) -> Result<Option<String>> {
+        Ok(sqlx::query_scalar("SELECT value FROM settings WHERE key = ?1")
+            .bind(key)
+            .fetch_optional(&self.pool)
+            .await?)
+    }
+
+    pub async fn set_setting(&self, key: &str, value: &str) -> Result<()> {
+        sqlx::query("INSERT INTO settings (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = ?2")
+            .bind(key)
+            .bind(value)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    // --- the archive ------------------------------------------------------
+
+    /// All sessions, newest first.
+    pub async fn sessions(&self) -> Result<Vec<SessionInfo>> {
+        let rows: Vec<SessionRow> = sqlx::query_as(
+            "SELECT s.id, s.day, s.started_at, s.ended_at, s.summary, s.oath, s.oath_day, s.oath_kept,
+                    (SELECT COALESCE(sum(v.minutes), 0) FROM vigils v WHERE v.session_id = s.id)
+             FROM sessions s ORDER BY s.id DESC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(SessionInfo::from).collect())
+    }
+
+    pub async fn session_info(&self, id: i64) -> Result<Option<SessionInfo>> {
+        let row: Option<SessionRow> = sqlx::query_as(
+            "SELECT s.id, s.day, s.started_at, s.ended_at, s.summary, s.oath, s.oath_day, s.oath_kept,
+                    (SELECT COALESCE(sum(v.minutes), 0) FROM vigils v WHERE v.session_id = s.id)
+             FROM sessions s WHERE s.id = ?1",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(SessionInfo::from))
+    }
+
+    /// Facts first learned in `session`.
+    pub async fn facts_of_session(&self, session: i64) -> Result<Vec<Fact>> {
+        let rows: Vec<(i64, String)> = sqlx::query_as("SELECT id, text FROM facts WHERE session_id = ?1 ORDER BY id")
+            .bind(session)
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows.into_iter().map(|(id, text)| Fact { id, text }).collect())
+    }
+
+    /// Burn a night: its words (and their search index) and the facts learned
+    /// in it are gone. Its focused minutes stay counted on their day, and the
+    /// chain of seals is not rewritten. Returns false if there was no such
+    /// session.
+    pub async fn delete_session(&self, session: i64) -> Result<bool> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("DELETE FROM facts WHERE session_id = ?1").bind(session).execute(&mut *tx).await?;
+        let r = sqlx::query("DELETE FROM sessions WHERE id = ?1").bind(session).execute(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(r.rows_affected() > 0)
+    }
+
     // --- facts ----------------------------------------------------------
 
     pub async fn facts(&self) -> Result<Vec<Fact>> {
@@ -477,6 +568,15 @@ impl Memory {
     pub async fn forget_fact(&self, id: i64) -> Result<bool> {
         let r = sqlx::query("DELETE FROM facts WHERE id = ?1").bind(id).execute(&self.pool).await?;
         Ok(r.rows_affected() > 0)
+    }
+}
+
+type SessionRow = (i64, String, String, Option<String>, Option<String>, Option<String>, Option<String>, Option<bool>, i64);
+
+impl From<SessionRow> for SessionInfo {
+    fn from(r: SessionRow) -> Self {
+        let (id, day, started_at, ended_at, summary, oath, oath_day, oath_kept, minutes) = r;
+        Self { id, day, started_at, ended_at, summary, oath, oath_day, oath_kept, focused_minutes: minutes as u32 }
     }
 }
 
@@ -623,6 +723,44 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(on_session, 25); // timed vigils only
+        cleanup(path);
+    }
+
+    #[tokio::test]
+    async fn the_archive_lists_and_burns_nights() {
+        let (m, path) = temp_memory().await;
+        let today = m.today().await.unwrap();
+        let s1 = m.start_session().await.unwrap();
+        m.add_message(s1, Speaker::Me, "The storage layout is hard.").await.unwrap();
+        m.add_facts(s1, &["They study the EVM.".into()]).await.unwrap();
+        m.set_oath(s1, "Read chapter nine.").await.unwrap();
+        m.add_vigil(s1, today, 25, VigilSource::Timer).await.unwrap();
+        m.finish_session(s1, Some("They studied storage."), false).await.unwrap();
+        let s2 = m.start_session().await.unwrap();
+
+        let all = m.sessions().await.unwrap();
+        assert_eq!(all.iter().map(|s| s.id).collect::<Vec<_>>(), [s2, s1]);
+        let one = m.session_info(s1).await.unwrap().unwrap();
+        assert_eq!(one.summary.as_deref(), Some("They studied storage."));
+        assert_eq!(one.oath.as_deref(), Some("Read chapter nine."));
+        assert_eq!(one.oath_kept, None);
+        assert_eq!(one.focused_minutes, 25);
+        assert!(all[0].ended_at.is_none());
+        assert_eq!(m.facts_of_session(s1).await.unwrap().len(), 1);
+
+        assert!(m.delete_session(s1).await.unwrap());
+        assert!(!m.delete_session(s1).await.unwrap());
+        assert!(m.session_info(s1).await.unwrap().is_none());
+        assert!(m.facts().await.unwrap().is_empty());
+        assert!(m.search("storage layout", 5, None).await.unwrap().is_empty());
+        assert_eq!(m.focus_on(today).await.unwrap().minutes, 25); // the work still counts
+
+        m.set_setting("voice", "5").await.unwrap();
+        m.set_setting("voice", "7").await.unwrap();
+        assert_eq!(m.setting("voice").await.unwrap().as_deref(), Some("7"));
+        assert_eq!(m.setting("nope").await.unwrap(), None);
+        m.set_speaks_first(false).await.unwrap();
+        assert!(!m.speaks_first().await.unwrap());
         cleanup(path);
     }
 

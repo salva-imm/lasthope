@@ -6,7 +6,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::thread;
 use std::time::Duration;
@@ -20,9 +20,51 @@ use tokio::sync::oneshot;
 
 use crate::config::Config;
 
-/// Kokoro speaker id (2 = the voice used so far) and pace.
-const VOICE_ID: i32 = 2;
-const SPEED: f32 = 1.0;
+/// Kokoro speaker id (2 = Bella, the voice used so far) and pace, until changed.
+pub const DEFAULT_VOICE: i32 = 2;
+pub const DEFAULT_SPEED: f32 = 1.0;
+pub const SPEED_RANGE: std::ops::RangeInclusive<f32> = 0.7..=1.3;
+
+/// The English speakers of kokoro-multi-lang-v1_0 (ids 0-27, in voices.bin
+/// order). The rest of its 53 voices are other languages, which our English
+/// phonemizer cannot feed.
+pub const VOICES: &[(i32, &str)] = &[
+    (0, "Alloy (US)"), (1, "Aoede (US)"), (2, "Bella (US)"), (3, "Heart (US)"),
+    (4, "Jessica (US)"), (5, "Kore (US)"), (6, "Nicole (US)"), (7, "Nova (US)"),
+    (8, "River (US)"), (9, "Sarah (US)"), (10, "Sky (US)"), (11, "Adam (US, male)"),
+    (12, "Echo (US, male)"), (13, "Eric (US, male)"), (14, "Fenrir (US, male)"),
+    (15, "Liam (US, male)"), (16, "Michael (US, male)"), (17, "Onyx (US, male)"),
+    (18, "Puck (US, male)"), (19, "Santa (US, male)"), (20, "Alice (UK)"), (21, "Emma (UK)"),
+    (22, "Isabella (UK)"), (23, "Lily (UK)"), (24, "Daniel (UK, male)"),
+    (25, "Fable (UK, male)"), (26, "George (UK, male)"), (27, "Lewis (UK, male)"),
+];
+
+/// Which voice and pace she speaks with; changeable while she runs.
+pub struct VoiceSettings {
+    sid: AtomicI32,
+    /// f32 bits
+    speed: AtomicU32,
+}
+
+impl Default for VoiceSettings {
+    fn default() -> Self {
+        Self { sid: AtomicI32::new(DEFAULT_VOICE), speed: AtomicU32::new(DEFAULT_SPEED.to_bits()) }
+    }
+}
+
+impl VoiceSettings {
+    pub fn set(&self, sid: i32, speed: f32) {
+        if VOICES.iter().any(|(id, _)| *id == sid) {
+            self.sid.store(sid, Ordering::Relaxed);
+        }
+        let speed = speed.clamp(*SPEED_RANGE.start(), *SPEED_RANGE.end());
+        self.speed.store(speed.to_bits(), Ordering::Relaxed);
+    }
+
+    fn get(&self) -> (i32, f32) {
+        (self.sid.load(Ordering::Relaxed), f32::from_bits(self.speed.load(Ordering::Relaxed)))
+    }
+}
 /// Silence before each reply (see `speak`).
 const LEAD_IN_MS: usize = 200;
 
@@ -35,6 +77,8 @@ pub trait Mouth: Send + Sync {
     fn speak(&self, text: String, cancel: Arc<AtomicBool>) -> oneshot::Receiver<Result<()>>;
     /// Synthesize `text` into a WAV file instead of playing it.
     fn save_wav(&self, text: String, path: PathBuf) -> oneshot::Receiver<Result<()>>;
+    /// Change voice and pace (no-op without a voice).
+    fn set_voice(&self, _sid: i32, _speed: f32) {}
 }
 
 enum Job {
@@ -45,17 +89,21 @@ enum Job {
 /// Handle to the voice thread.
 pub struct Voice {
     jobs: std_mpsc::Sender<Job>,
+    settings: Arc<VoiceSettings>,
 }
 
 impl Voice {
     /// Load Kokoro and the phonemizer on a dedicated thread.
     pub fn spawn(cfg: &Config) -> Result<Self> {
         let dir = cfg.kokoro_dir.clone();
+        let settings = Arc::new(VoiceSettings::default());
+        let engine_settings = settings.clone();
         let (jobs, rx) = std_mpsc::channel::<Job>();
         let (init_tx, init_rx) = std_mpsc::channel();
         thread::Builder::new().name("voice".into()).spawn(move || {
             let engine = match Engine::load(&dir) {
-                Ok(e) => {
+                Ok(mut e) => {
+                    e.settings = engine_settings;
                     let _ = init_tx.send(Ok(()));
                     e
                 }
@@ -76,7 +124,7 @@ impl Voice {
             }
         })?;
         init_rx.recv().context("voice thread died while loading")??;
-        Ok(Self { jobs })
+        Ok(Self { jobs, settings })
     }
 
     fn submit(&self, make: impl FnOnce(oneshot::Sender<Result<()>>) -> Job) -> oneshot::Receiver<Result<()>> {
@@ -95,11 +143,16 @@ impl Mouth for Voice {
     fn save_wav(&self, text: String, path: PathBuf) -> oneshot::Receiver<Result<()>> {
         self.submit(|done| Job::Save { text, path, done })
     }
+
+    fn set_voice(&self, sid: i32, speed: f32) {
+        self.settings.set(sid, speed);
+    }
 }
 
 pub(crate) struct Engine {
     tts: OfflineTts,
     g2p: G2p,
+    settings: Arc<VoiceSettings>,
 }
 
 impl Engine {
@@ -123,7 +176,7 @@ impl Engine {
         let tts = OfflineTts::create(&c).ok_or_else(|| anyhow!("failed to load Kokoro"))?;
         let g2p = G2p::new(Dialect::American, OovFallback::Neural)
             .map_err(|e| anyhow!("failed to load phonemizer: {e:?}"))?;
-        Ok(Self { tts, g2p })
+        Ok(Self { tts, g2p, settings: Arc::default() })
     }
 
     /// One sentence -> samples at the model's sample rate.
@@ -132,9 +185,10 @@ impl Engine {
         if phonemes.trim().is_empty() {
             return Ok(None);
         }
+        let (sid, speed) = self.settings.get();
         let cfg = GenerationConfig {
-            sid: VOICE_ID,
-            speed: SPEED,
+            sid,
+            speed,
             phoneme_codepoints: Some(vec![phonemes.chars().map(|c| c as i32).collect()]),
             ..Default::default()
         };
