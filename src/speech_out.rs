@@ -14,7 +14,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow};
 use loqui_g2p::{Dialect, G2p, OovFallback};
 use rodio::buffer::SamplesBuffer;
-use rodio::{DeviceSinkBuilder, Player};
+use rodio::{DeviceSinkBuilder, MixerDeviceSink, Player};
 use sherpa_onnx::{GenerationConfig, OfflineTts, OfflineTtsConfig};
 use tokio::sync::oneshot;
 
@@ -147,7 +147,7 @@ impl Engine {
 
     fn speak(&self, text: &str, cancel: &AtomicBool) -> Result<()> {
         // Open the speaker per reply so a changed output device (headphones) is picked up.
-        let mut sink = DeviceSinkBuilder::open_default_sink().context("opening the speaker")?;
+        let mut sink = open_speaker()?;
         sink.log_on_drop(false);
         let player = Player::connect_new(sink.mixer());
         // Bluetooth headphones often swallow the first moments of a new stream;
@@ -194,6 +194,35 @@ impl Engine {
         anyhow::ensure!(ok, "could not write {}", path.display());
         Ok(())
     }
+}
+
+/// Open the default output device with a buffer size it actually supports.
+/// rodio aims for 50 ms (2048 frames at 44.1 kHz), which Bluetooth headphones
+/// on macOS reject ("supported range 14..=1024"), so clamp to the device's
+/// range; then try the device's own default; then rodio's full fallback.
+fn open_speaker() -> Result<MixerDeviceSink> {
+    use rodio::cpal::traits::{DeviceTrait, HostTrait};
+    use rodio::cpal::{BufferSize, SupportedBufferSize};
+
+    let device = rodio::cpal::default_host().default_output_device();
+    if let Some(device) = device {
+        if let Ok(config) = device.default_output_config() {
+            let ideal = (config.sample_rate() / 20).next_power_of_two() / 2; // ~50 ms
+            let size = match *config.buffer_size() {
+                SupportedBufferSize::Range { min, max } => ideal.clamp(min, max),
+                SupportedBufferSize::Unknown => ideal,
+            };
+            for buffer in [BufferSize::Fixed(size), BufferSize::Default] {
+                if let Ok(sink) = DeviceSinkBuilder::from_device(device.clone())
+                    .map(|b| b.with_buffer_size(buffer))
+                    .and_then(|b| b.open_stream())
+                {
+                    return Ok(sink);
+                }
+            }
+        }
+    }
+    DeviceSinkBuilder::open_default_sink().context("opening the speaker")
 }
 
 /// Strip what cannot be spoken (markdown symbols) and apply pronunciation fixes.
@@ -310,6 +339,19 @@ mod tests {
         for word in ["oath", "minutes", "rust", "evm", "last hope"] {
             assert!(heard.contains(word), "missing {word:?} in {heard:?}");
         }
+    }
+
+    /// Opens the real default speaker and plays 300 ms of silence.
+    /// `cargo test --release opens_the_speaker -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn opens_the_speaker() {
+        let mut sink = open_speaker().expect("speaker");
+        sink.log_on_drop(false);
+        println!("speaker config: {:?}", sink.config());
+        let player = Player::connect_new(sink.mixer());
+        player.append(SamplesBuffer::new(1.try_into().unwrap(), 24_000.try_into().unwrap(), vec![0.0f32; 7200]));
+        player.sleep_until_end();
     }
 
     #[test]
