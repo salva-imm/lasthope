@@ -3,8 +3,8 @@
 A personal voice companion written in Rust. You speak, she listens, thinks and answers aloud.
 Hearing and speaking run locally; only the language model call goes to the cloud.
 
-> Work in progress. Phase 1 of 5: solid foundation. Persona, memory, the focus
-> timer's voice and the web UI arrive in later phases.
+> Work in progress. Phases 1-2 of 5 are done: the foundation, her character and
+> conversation. Persistent memory, the focus timer's voice and the web UI come next.
 
 ## How it works
 
@@ -31,8 +31,8 @@ src/
   audio_in.rs    mic -> VAD -> Whisper (and the mic gate)
   speech_out.rs  text -> phonemes -> Kokoro -> speaker, sentence chunking
   llm.rs         OpenAI-compatible client
-  persona.rs     system prompt and sampling
-  memory.rs      session transcript (SQLite in phase 3)
+  persona.rs     loads persona.md, builds each request, cleans replies
+  memory.rs      session transcript and recent history (SQLite in phase 3)
   timer.rs       the vigil (focus timer)
   text_io.rs     stdin/stdout mode, slash-commands, event printer
 ```
@@ -58,6 +58,7 @@ sends `Command`s and watches `Event`s:
    LLM_MODEL=...        # check your provider's current model list
    ```
    Real environment variables override `.env`. To switch providers, change these three.
+   Optional: `LLM_TEMPERATURE` (default 0.8), `PERSONA_PATH` (default `./persona.md`).
 
 ## Run
 
@@ -70,15 +71,29 @@ cargo run --release -- --text  # type instead: stdin replaces the mic, stdout th
 Typed lines wait until she has finished replying, so you can also pipe a script:
 
 ```bash
-printf 'talk to me, what is the great work?\ntalk to me, and the vigil?\n' | cargo run --release -- --text
+printf 'What is the great work?\nAnd what is a vigil?\n' | cargo run --release -- --text
 ```
 
-### Talking to her (phase 1)
+### Talking to her
 
-Start what you say with a trigger phrase (removed in phase 2):
+Just talk. Everything you say goes to her, with the recent conversation
+(the last 16 lines, up to about 4000 characters) so she follows the thread.
+Two spoken phrases are commands instead:
 
-- **"talk to me …"**, "please ai …": she answers aloud.
-- **"please say …"**, "please generate …", "please store …": the rest is spoken into `output.wav` (voice mode only).
+- **"close the rite"** or **"end the session"** (on its own): ends the session.
+- **"please say …"** (or "please generate …", "please store …"): the rest is
+  spoken into `output.wav` instead of being answered (voice mode only).
+
+### Her character
+
+She lives in [`persona.md`](persona.md): a calm, dark, commanding mentor who
+speaks in the language of ritual (the great work, oaths, vigils, seals) and
+pushes you toward your work, the gym and other people rather than toward
+talking to her. The file is re-read on every reply, so edits apply
+immediately. HTML comments in it are notes and are not sent.
+
+Whatever the model returns, the code keeps her spoken: reasoning blocks,
+markdown and list markup are stripped, and a reply is cut to four sentences.
 
 ### Commands
 

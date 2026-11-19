@@ -20,14 +20,11 @@ use tokio::time::MissedTickBehavior;
 use crate::audio_in::Gate;
 use crate::llm::LlmClient;
 use crate::memory::{Memory, Speaker};
-use crate::persona;
+use crate::persona::{self, Persona};
 use crate::speech_out::Mouth;
 use crate::timer::{DEFAULT_VIGIL, Vigil};
 
 const WAV_PATH: &str = "output.wav";
-/// After a bare trigger phrase ("talk to me" + pause), the next utterance
-/// within this window is taken as the request.
-const ARMED_FOR: Duration = Duration::from_secs(15);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -162,32 +159,49 @@ enum Flow {
     Stop,
 }
 
-/// Phase 1 keeps the original trigger phrases; phase 2 removes them.
+/// Everything heard goes to her, except these spoken commands.
 #[derive(Debug, PartialEq, Eq)]
-enum Route {
+enum Spoken {
+    /// "please say …" / "please generate …" / "please store …": speak the rest into output.wav.
     SaveWav(String),
-    Ask(String),
-    Ignore,
+    /// "close the rite", "end the session".
+    EndSession,
+    Talk,
 }
 
-fn route(text: &str) -> Route {
-    const SAVE: &[&str] = &["please generate", "please store", "please say"];
-    const ASK: &[&str] = &["please ai", "colon colon ai", "::ai", "talk to me"];
+fn spoken_command(text: &str) -> Spoken {
+    const SAVE: &[&str] = &["please say", "please generate", "please store"];
+    // Whisper writes "rite" as "right" or "write" often enough to accept those too.
+    const END: &[&str] = &[
+        "close the rite", "close the right", "close the write",
+        "end the rite", "end the right", "end the session", "end session",
+    ];
     let lower = text.to_lowercase();
-    let rest = |prefix: &str| {
-        text.get(prefix.len()..)
-            .unwrap_or(&lower[prefix.len()..])
-            .trim_start_matches(|c: char| c.is_whitespace() || matches!(c, ',' | '.' | ':' | '-'))
-            .trim()
-            .to_string()
-    };
     if let Some(p) = SAVE.iter().find(|p| lower.starts_with(*p)) {
-        Route::SaveWav(rest(p))
-    } else if let Some(p) = ASK.iter().find(|p| lower.starts_with(*p)) {
-        Route::Ask(rest(p))
-    } else {
-        Route::Ignore
+        let rest = text
+            .get(p.len()..)
+            .unwrap_or(&lower[p.len()..])
+            .trim_start_matches(|c: char| c.is_whitespace() || matches!(c, ',' | '.' | ':' | '-'))
+            .trim();
+        return Spoken::SaveWav(rest.to_string());
     }
+    // The whole utterance must be the command, give or take a polite word,
+    // so "we should end the session soon" is still just conversation.
+    let words: String = lower
+        .chars()
+        .map(|c| if c.is_alphanumeric() || c == ' ' { c } else { ' ' })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut core = words.as_str();
+    for filler in ["okay ", "ok ", "alright ", "now ", "lasthope ", "last hope ", "please "] {
+        core = core.strip_prefix(filler).unwrap_or(core);
+    }
+    for filler in [" now", " please", " for tonight", " lasthope", " last hope"] {
+        core = core.strip_suffix(filler).unwrap_or(core);
+    }
+    if END.contains(&core) { Spoken::EndSession } else { Spoken::Talk }
 }
 
 pub struct Core {
@@ -201,6 +215,7 @@ pub struct Core {
     done_tx: mpsc::UnboundedSender<(u64, Done)>,
     done_rx: mpsc::UnboundedReceiver<(u64, Done)>,
     memory: Memory,
+    persona: Persona,
     vigil: Vigil,
     muted: bool,
     asleep: bool,
@@ -210,13 +225,12 @@ pub struct Core {
     task: Option<JoinHandle<()>>,
     end_when_idle: bool,
     published: Option<(State, bool)>,
-    /// A trigger phrase heard on its own, waiting for the request that follows.
-    armed: Option<(Route, Instant)>,
 }
 
 impl Core {
     pub fn new(
         llm: LlmClient,
+        persona: Persona,
         mouth: Arc<dyn Mouth>,
         gate: Gate,
         pacer: Pacer,
@@ -235,6 +249,7 @@ impl Core {
             done_tx,
             done_rx,
             memory: Memory::default(),
+            persona,
             vigil: Vigil::new(DEFAULT_VIGIL),
             muted: false,
             asleep: false,
@@ -244,7 +259,6 @@ impl Core {
             task: None,
             end_when_idle: false,
             published: None,
-            armed: None,
         }
     }
 
@@ -304,7 +318,7 @@ impl Core {
         match input {
             Input::Heard(text) => {
                 self.heard_since_refresh += 1;
-                self.on_heard(text.trim());
+                return self.on_heard(text.trim());
             }
             Input::Command(cmd) => return self.on_command(cmd),
             Input::EndOfInput => self.end_when_idle = true,
@@ -312,41 +326,28 @@ impl Core {
         Flow::Continue
     }
 
-    fn on_heard(&mut self, text: &str) {
+    fn on_heard(&mut self, text: &str) -> Flow {
         if text.is_empty() {
-            return;
+            return Flow::Continue;
         }
         if self.muted || self.state() != State::Listening {
             self.notice(format!("not listening ({:?}{}), ignored: {text}",
                 self.state(), if self.muted { ", deafened" } else { "" }));
-            return;
+            return Flow::Continue;
         }
-        self.memory.record(Speaker::Me, text);
         self.emit(Event::UserSpoke { text: text.to_string() });
-        let mut route = route(text);
-        // "talk to me" ... pause ... "tell me about Rust": join the two
-        if route == Route::Ignore {
-            if let Some((armed, at)) = self.armed.take() {
-                if at.elapsed() < ARMED_FOR {
-                    route = match armed {
-                        Route::SaveWav(_) => Route::SaveWav(text.to_string()),
-                        _ => Route::Ask(text.to_string()),
-                    };
-                }
+        match spoken_command(text) {
+            Spoken::EndSession => return Flow::Stop,
+            Spoken::SaveWav(content) if content.is_empty() => {
+                self.notice("say the words to save after \"please say\"")
+            }
+            Spoken::SaveWav(content) => self.start_save(content),
+            Spoken::Talk => {
+                self.memory.record(Speaker::Me, text);
+                self.start_reply();
             }
         }
-        self.armed = None;
-        match route {
-            Route::Ask(prompt) if !prompt.is_empty() => self.start_reply(prompt),
-            Route::SaveWav(content) if !content.is_empty() => self.start_save(content),
-            r @ (Route::Ask(_) | Route::SaveWav(_)) => {
-                self.armed = Some((r, Instant::now()));
-                self.notice("she waits for your words");
-            }
-            Route::Ignore => self.notice(
-                "no trigger phrase; start with \"talk to me\" (or \"please say\" to save output.wav)",
-            ),
-        }
+        Flow::Continue
     }
 
     fn on_command(&mut self, cmd: Command) -> Flow {
@@ -378,11 +379,15 @@ impl Core {
         }
         self.task = None;
         match done {
-            Done::Reply(Ok(text)) => {
-                self.memory.record(Speaker::Her, &text);
-                self.emit(Event::SheSpoke { text: text.clone() });
-                self.start_speaking(text);
-                return Flow::Continue;
+            Done::Reply(Ok(raw)) => {
+                let text = persona::clean_reply(&raw);
+                if !text.is_empty() {
+                    self.memory.record(Speaker::Her, &text);
+                    self.emit(Event::SheSpoke { text: text.clone() });
+                    self.start_speaking(text);
+                    return Flow::Continue;
+                }
+                self.emit(Event::Error { message: format!("unspeakable reply: {raw:?}") });
             }
             Done::Reply(Err(e)) => self.emit(Event::Error { message: format!("{e:#}") }),
             Done::Spoke(Err(e)) => self.emit(Event::Error { message: format!("voice: {e:#}") }),
@@ -420,12 +425,16 @@ impl Core {
         self.turn_id
     }
 
-    fn start_reply(&mut self, prompt: String) {
+    /// Ask her to answer the conversation so far.
+    fn start_reply(&mut self) {
         let id = self.next_turn(Turn::Thinking);
+        let history = self.memory.recent(persona::HISTORY_LINES, persona::HISTORY_CHARS);
+        let messages = self.persona.messages(history);
+        let sampling = self.persona.sampling();
         let llm = self.llm.clone();
         let tx = self.done_tx.clone();
         self.task = Some(tokio::spawn(async move {
-            let reply = llm.chat(&persona::messages(&prompt), persona::SAMPLING).await;
+            let reply = llm.chat(&messages, sampling).await;
             let _ = tx.send((id, Done::Reply(reply)));
         }));
     }
@@ -496,12 +505,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn routes_trigger_phrases() {
-        assert_eq!(route("Talk to me, what is an oath?"), Route::Ask("what is an oath?".into()));
-        assert_eq!(route("please AI explain gas"), Route::Ask("explain gas".into()));
-        assert_eq!(route("Please say Hello there."), Route::SaveWav("Hello there.".into()));
-        assert_eq!(route("talk to me"), Route::Ask(String::new()));
-        assert_eq!(route("what time is it"), Route::Ignore);
+    fn spoken_commands() {
+        assert_eq!(spoken_command("Please say Hello there."), Spoken::SaveWav("Hello there.".into()));
+        assert_eq!(spoken_command("please generate"), Spoken::SaveWav(String::new()));
+        assert_eq!(spoken_command("Close the rite."), Spoken::EndSession);
+        assert_eq!(spoken_command("Okay, close the right now."), Spoken::EndSession);
+        assert_eq!(spoken_command("End the session, Lasthope."), Spoken::EndSession);
+        assert_eq!(spoken_command("We should end the session soon."), Spoken::Talk);
+        assert_eq!(spoken_command("Talk to me, what is an oath?"), Spoken::Talk);
+        assert_eq!(spoken_command("Say something."), Spoken::Talk);
     }
 
     #[test]

@@ -67,6 +67,7 @@ pub fn spawn_stdin(handle: CoreHandle, pacer: Pacer, end_on_eof: bool) {
     std::thread::Builder::new()
         .name("stdin".into())
         .spawn(move || {
+            let interactive = stdin_is_terminal();
             for line in std::io::stdin().lock().lines() {
                 let Ok(line) = line else { break };
                 let line = line.trim();
@@ -77,7 +78,7 @@ pub fn spawn_stdin(handle: CoreHandle, pacer: Pacer, end_on_eof: bool) {
                     Some(Ok(cmd)) => handle.command(cmd),
                     Some(Err(help)) => eprintln!("{help}"),
                     None => {
-                        if !pacer.is_free() {
+                        if interactive && !pacer.is_free() {
                             eprintln!("  · she is not done yet; your words wait their turn");
                         }
                         pacer.wait_and_claim();

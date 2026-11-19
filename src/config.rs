@@ -21,6 +21,10 @@ pub struct Config {
     pub kokoro_dir: PathBuf,
     /// Directory holding silero_vad.onnx and the sherpa-onnx Whisper model.
     pub models_dir: PathBuf,
+    /// Her character: the system prompt, re-read on every request.
+    pub persona_path: PathBuf,
+    /// Sampling temperature (variety of her replies).
+    pub temperature: f32,
 }
 
 impl Config {
@@ -52,6 +56,15 @@ impl Config {
             },
             kokoro_dir: get("KOKORO_DIR").unwrap_or("./kokoro-multi-lang-v1_0".into()).into(),
             models_dir: get("MODELS_DIR").unwrap_or("./models".into()).into(),
+            persona_path: get("PERSONA_PATH").unwrap_or("./persona.md".into()).into(),
+            temperature: match get("LLM_TEMPERATURE") {
+                None => 0.8,
+                Some(t) => t
+                    .parse()
+                    .ok()
+                    .filter(|t: &f32| (0.0..=2.0).contains(t))
+                    .ok_or_else(|| anyhow::anyhow!("LLM_TEMPERATURE must be a number from 0 to 2, got {t:?}"))?,
+            },
         })
     }
 }

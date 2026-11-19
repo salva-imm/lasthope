@@ -22,6 +22,7 @@ use crate::audio_in::Gate;
 use crate::config::Config;
 use crate::core_loop::{Command, Core, Input};
 use crate::llm::LlmClient;
+use crate::persona::Persona;
 use crate::speech_out::{Mouth, Voice};
 
 const USAGE: &str = "\
@@ -31,7 +32,11 @@ usage: lasthope [--text]
            (no speech models are loaded)
 
 settings (environment or .env): LLM_BASE_URL, LLM_API_KEY, LLM_MODEL
-optional: KOKORO_DIR (./kokoro-multi-lang-v1_0), MODELS_DIR (./models)";
+optional: LLM_TEMPERATURE (0.8), PERSONA_PATH (./persona.md),
+          KOKORO_DIR (./kokoro-multi-lang-v1_0), MODELS_DIR (./models)
+
+spoken commands: \"close the rite\" / \"end the session\" ends the session,
+                 \"please say …\" speaks the rest into output.wav";
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -47,6 +52,7 @@ async fn main() -> Result<()> {
 
     let cfg = Config::load()?;
     let llm = LlmClient::new(cfg.llm.clone())?;
+    let persona = Persona::new(cfg.persona_path.clone(), cfg.temperature);
     let (handle, inputs) = core_loop::channel();
     let gate = Gate::new(false);
     let pacer = core_loop::Pacer::default();
@@ -76,12 +82,13 @@ async fn main() -> Result<()> {
     }
 
     eprintln!(
-        "lasthope: {} mode, mind = {} — /help for commands, Ctrl-C to end",
+        "lasthope: {} mode, mind = {}, persona = {} — /help for commands, Ctrl-C to end",
         if text_mode { "text" } else { "voice" },
-        llm.model()
+        llm.model(),
+        persona.path().display()
     );
 
-    let memory = Core::new(llm, mouth, gate, pacer, handle, inputs).run().await;
+    let memory = Core::new(llm, persona, mouth, gate, pacer, handle, inputs).run().await;
     let _ = tokio::time::timeout(Duration::from_secs(1), printer).await;
     eprintln!("  · {} lines spoken this session", memory.transcript().len());
     Ok(())
