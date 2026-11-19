@@ -27,15 +27,17 @@ function whisper(text, isError) {
 
 // --- the page ------------------------------------------------------------
 
-let doc = null;
+let loading = null;         // pdf.js loading task of the book open in the viewer
 let docBook = null;
 let task = null;
 let drawn = 0;
 
-async function documentOf(book) {
-  if (doc && docBook === book) return doc;
-  if (doc) { doc.destroy(); doc = null; docBook = null; }
-  doc = await pdfjs.getDocument({
+// One book open at a time. (pdf.js 6: only the loading task can be destroyed.)
+function documentOf(book) {
+  if (loading && docBook === book) return loading.promise;
+  if (loading) loading.destroy();
+  docBook = book;
+  loading = pdfjs.getDocument({
     url: `/api/books/${book}/file`,
     cMapUrl: '/pdfjs/cmaps/',
     cMapPacked: true,
@@ -43,9 +45,8 @@ async function documentOf(book) {
     wasmUrl: '/pdfjs/wasm/',
     isEvalSupported: false,
     enableXfa: false,
-  }).promise;
-  docBook = book;
-  return doc;
+  });
+  return loading.promise;
 }
 
 async function render() {
@@ -73,6 +74,9 @@ async function render() {
   } catch (e) {
     if (e && e.name === 'RenderingCancelledException') return;
     if (mine !== drawn) return;
+    if (loading) loading.destroy();
+    loading = null;             // a failed book is fetched afresh next time
+    docBook = null;
     canvas.hidden = true;
     $('sheet-empty').hidden = false;
     $('sheet-empty').textContent = `The page will not show: ${e.message || e}`;
