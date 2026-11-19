@@ -35,7 +35,7 @@ pub struct Persona {
 
 impl Persona {
     pub fn new(path: PathBuf, temperature: f32) -> Self {
-        Self { path, sampling: Sampling { temperature, seed: None }, warned: false }
+        Self { path, sampling: Sampling { temperature, seed: None, json: false }, warned: false }
     }
 
     pub fn sampling(&self) -> Sampling {
@@ -408,7 +408,7 @@ pub fn summary_messages(lines: &[Line], known_facts: &[String], mission: &str) -
     vec![ChatMessage::new(Role::System, system), ChatMessage::new(Role::User, transcript)]
 }
 
-pub const SUMMARY_SAMPLING: Sampling = Sampling { temperature: 0.2, seed: None };
+pub const SUMMARY_SAMPLING: Sampling = Sampling { temperature: 0.2, seed: None, json: true };
 
 /// Pull `{"summary": ..., "facts": [...]}` out of a reply, tolerating code
 /// fences or prose around the JSON.

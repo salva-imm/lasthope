@@ -34,6 +34,8 @@ impl ChatMessage {
 pub struct Sampling {
     pub temperature: f32,
     pub seed: Option<u64>,
+    /// Ask for a JSON object (`response_format`); the prompt must say JSON.
+    pub json: bool,
 }
 
 #[derive(Serialize)]
@@ -43,6 +45,8 @@ struct Request<'a> {
     temperature: f32,
     #[serde(skip_serializing_if = "Option::is_none")]
     seed: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    response_format: Option<serde_json::Value>,
     stream: bool,
 }
 
@@ -93,11 +97,12 @@ impl LlmClient {
         on_retry: impl Fn(Trouble),
     ) -> Result<String> {
         let url = format!("{}/chat/completions", self.cfg.base_url);
-        let body = Request {
+        let mut body = Request {
             model: &self.cfg.model,
             messages,
             temperature: sampling.temperature,
             seed: sampling.seed,
+            response_format: sampling.json.then(|| serde_json::json!({ "type": "json_object" })),
             stream: false,
         };
         // Free tiers rate-limit by tokens per minute: wait as asked and retry.
@@ -126,6 +131,12 @@ impl LlmClient {
             let text = res.text().await.context("reading LLM response")?;
             if status.is_success() {
                 break text;
+            }
+            // a provider without JSON mode: ask again without it (the prompt still asks for JSON)
+            if status.as_u16() == 400 && body.response_format.is_some() && text.contains("response_format") {
+                body.response_format = None;
+                attempt -= 1;
+                continue;
             }
             let trouble = match status.as_u16() {
                 429 => Trouble::RateLimited,

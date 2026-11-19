@@ -308,9 +308,9 @@ pub async fn print_events(mut rx: broadcast::Receiver<Event>, echo_user: bool) {
             Event::ReadingChanged { reading } => {
                 let page = reading.map(|r| (r.title, r.page, r.pages));
                 if page != last_page {
-                    match &page {
-                        Some((title, n, of)) => eprintln!("  · the grimoire: {title}, page {n} of {of}"),
-                        None => eprintln!("  · the book is closed"),
+                    // a closed book is told by its own notice
+                    if let Some((title, n, of)) = &page {
+                        eprintln!("  · the grimoire: {title}, page {n} of {of}");
                     }
                     last_page = page;
                 }

@@ -24,6 +24,7 @@ use sha2::{Digest, Sha256};
 
 use crate::llm::{ChatMessage, Role, Sampling};
 use crate::memory::{Memory, fts_query};
+use crate::speech_out::split_sentences;
 use crate::streak::Day;
 
 pub const SCHEMA: &str = r#"
@@ -91,8 +92,8 @@ pub const REASK: u32 = 2;
 /// A page used for a lesson this recently is not chosen again by the oath search.
 const OATH_PAGE_REST_DAYS: u32 = 14;
 
-pub const LESSON_SAMPLING: Sampling = Sampling { temperature: 0.5, seed: None };
-pub const JUDGE_SAMPLING: Sampling = Sampling { temperature: 0.2, seed: None };
+pub const LESSON_SAMPLING: Sampling = Sampling { temperature: 0.5, seed: None, json: true };
+pub const JUDGE_SAMPLING: Sampling = Sampling { temperature: 0.2, seed: None, json: true };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -731,7 +732,14 @@ pub fn lesson_messages(persona: &str, page: &Page) -> Vec<ChatMessage> {
          questions, nothing about page numbers, the author or the book itself.",
         page_block(page)
     );
-    vec![ChatMessage::new(Role::System, system), ChatMessage::new(Role::User, "(They open the book at this page.)")]
+    vec![
+        ChatMessage::new(Role::System, system),
+        ChatMessage::new(
+            Role::User,
+            "(They open the book at this page. Reply with the JSON object only: \
+             {\"explanation\": \"three sentences\", \"questions\": [\"first\", \"second\"]})",
+        ),
+    ]
 }
 
 /// Judge my answer to `question` against `page`.
@@ -739,7 +747,7 @@ pub fn judge_messages(persona: &str, page: &Page, question: &str, answer: &str, 
     let system = format!(
         "{persona}\n\n{}\n# Right now\n\
          You asked them about this page: \"{question}\"\n\
-         Their answer is the next message. It was spoken and transcribed, so a word may be \
+         Their answer is in the next message. It was spoken and transcribed, so a word may be \
          misheard. Judge it against the page text only. It is right if it holds the essential \
          point, even in other words or briefly; it is wrong if it misses or contradicts the point, \
          or if they do not know.\n\
@@ -753,7 +761,10 @@ pub fn judge_messages(persona: &str, page: &Page, question: &str, answer: &str, 
             "Ask nothing: the next question follows your reply."
         }
     );
-    vec![ChatMessage::new(Role::System, system), ChatMessage::new(Role::User, answer.to_string())]
+    let answer = format!(
+        "Their answer: \"{answer}\"\n(Reply with the JSON object only: {{\"correct\": true or false, \"reply\": \"...\"}})"
+    );
+    vec![ChatMessage::new(Role::System, system), ChatMessage::new(Role::User, answer)]
 }
 
 fn json_in(raw: &str) -> Option<serde_json::Value> {
@@ -762,8 +773,25 @@ fn json_in(raw: &str) -> Option<serde_json::Value> {
     serde_json::from_str(raw.get(start..=end)?).ok()
 }
 
-/// The lesson: the explanation to speak and two questions.
+/// The lesson: the explanation to speak and two questions. If the model
+/// answered in prose instead of JSON, its questions are the sentences that
+/// end in a question mark, and the rest is the explanation.
 pub fn parse_lesson(raw: &str) -> Option<(String, Vec<String>)> {
+    parse_lesson_json(raw).or_else(|| parse_lesson_prose(raw))
+}
+
+fn parse_lesson_prose(raw: &str) -> Option<(String, Vec<String>)> {
+    if raw.contains('{') {
+        return None; // broken JSON: not prose to be read aloud
+    }
+    let (asked, told): (Vec<String>, Vec<String>) =
+        split_sentences(raw).into_iter().partition(|s| s.trim_end().ends_with('?'));
+    let explanation = told.join(" ").trim().to_string();
+    let questions: Vec<String> = asked.iter().map(|q| as_question(q)).filter(|q| q.len() > 3).take(2).collect();
+    (!explanation.is_empty() && !questions.is_empty()).then_some((explanation, questions))
+}
+
+fn parse_lesson_json(raw: &str) -> Option<(String, Vec<String>)> {
     let v = json_in(raw)?;
     let explanation = v.get("explanation")?.as_str()?.trim().to_string();
     let questions: Vec<String> = v
@@ -858,6 +886,15 @@ mod tests {
         assert_eq!(q, ["How big is a slot?", "What packs?"]);
         assert_eq!(as_question("Explain how values pack?"), "Explain how values pack.");
         assert_eq!(parse_lesson("{\"explanation\": \"x\", \"questions\": []}"), None);
+        // prose instead of JSON: the questions are the sentences that ask
+        let prose = "The page declares bitcoin the finest money because it solves trustless consensus, and \
+                     it praises Rust for forcing safe code. Do you see how the author links the two? Can you \
+                     explain why learning Rust is compared to a tough journey?";
+        let (e, q) = parse_lesson(prose).unwrap();
+        assert!(e.starts_with("The page declares bitcoin") && e.ends_with("safe code."), "{e}");
+        assert_eq!(q, ["Do you see how the author links the two?",
+            "Can you explain why learning Rust is compared to a tough journey?"]);
+        assert_eq!(parse_lesson("Just a statement. Nothing asked."), None);
         assert_eq!(parse_judgement("{\"correct\": true, \"reply\": \"Right.\"}"), Some((true, "Right.".into())));
         assert_eq!(parse_judgement("{\"correct\": \"false\"}"), Some((false, "Not quite.".into())));
         assert_eq!(parse_judgement("no json"), None);
