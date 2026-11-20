@@ -595,6 +595,15 @@ impl Memory {
         Ok(())
     }
 
+    /// What I said was no answer after all: the question waits again.
+    pub async fn unanswer_question(&self, id: i64) -> Result<()> {
+        sqlx::query("UPDATE questions SET answer = NULL, answered_at = NULL WHERE id = ?1")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     pub async fn judge_question(&self, id: i64, correct: bool, judgement: &str) -> Result<()> {
         sqlx::query("UPDATE questions SET correct = ?2, judgement = ?3 WHERE id = ?1")
             .bind(id)
@@ -747,11 +756,16 @@ pub fn judge_messages(persona: &str, page: &Page, question: &str, answer: &str, 
     let system = format!(
         "{persona}\n\n{}\n# Right now\n\
          You asked them about this page: \"{question}\"\n\
-         Their answer is in the next message. It was spoken and transcribed, so a word may be \
-         misheard. Judge it against the page text only. It is right if it holds the essential \
-         point, even in other words or briefly; it is wrong if it misses or contradicts the point, \
-         or if they do not know.\n\
-         Reply with JSON only, no prose around it: {{\"correct\": true or false, \"reply\": \"...\"}}\n\
+         What they said next is in the next message. It was spoken and transcribed, so a word may \
+         be misheard.\n\
+         First decide whether it is an attempt to answer that question. Saying they do not know, or \
+         asking you to repeat or explain the question, counts as answering. Anything else they \
+         bring up instead (another subject, a question of their own, news of their day, a request) \
+         is not an answer: then reply with {{\"answering\": false}} and nothing more.\n\
+         If it is an answer, judge it against the page text only. It is right if it holds the \
+         essential point, even in other words or briefly; it is wrong if it misses or contradicts \
+         the point, or if they do not know.\n\
+         Reply with JSON only, no prose around it: {{\"answering\": true, \"correct\": true or false, \"reply\": \"...\"}}\n\
          reply: one or two short spoken sentences. Say plainly whether they were right. If they \
          were wrong, give the right answer from the page in one sentence. {}",
         page_block(page),
@@ -762,7 +776,7 @@ pub fn judge_messages(persona: &str, page: &Page, question: &str, answer: &str, 
         }
     );
     let answer = format!(
-        "Their answer: \"{answer}\"\n(Reply with the JSON object only: {{\"correct\": true or false, \"reply\": \"...\"}})"
+        "They said: \"{answer}\"\n(Reply with the JSON object only: {{\"answering\": true, \"correct\": true or false, \"reply\": \"...\"}}, or {{\"answering\": false}} if this is not an answer to your question.)"
     );
     vec![ChatMessage::new(Role::System, system), ChatMessage::new(Role::User, answer)]
 }
@@ -806,9 +820,26 @@ fn parse_lesson_json(raw: &str) -> Option<(String, Vec<String>)> {
     (!explanation.is_empty() && !questions.is_empty()).then_some((explanation, questions))
 }
 
-/// The verdict on my answer and what she says of it.
-pub fn parse_judgement(raw: &str) -> Option<(bool, String)> {
+/// What she made of what I said while her question was open.
+#[derive(Debug, PartialEq)]
+pub enum Judged {
+    /// An answer: whether it was right, and what she says of it.
+    Answer { correct: bool, reply: String },
+    /// Not an answer: something else to talk about. The question stays open.
+    Aside,
+}
+
+/// The verdict on my answer and what she says of it, or that it was no answer.
+pub fn parse_judgement(raw: &str) -> Option<Judged> {
     let v = json_in(raw)?;
+    let answering = match v.get("answering") {
+        Some(serde_json::Value::Bool(b)) => *b,
+        Some(serde_json::Value::String(s)) => !matches!(s.trim().to_lowercase().as_str(), "false" | "no"),
+        _ => true, // no flag: an answer, as long as it carries a verdict
+    };
+    if !answering {
+        return Some(Judged::Aside);
+    }
     let correct = match v.get("correct")? {
         serde_json::Value::Bool(b) => *b,
         serde_json::Value::String(s) => match s.trim().to_lowercase().as_str() {
@@ -824,7 +855,7 @@ pub fn parse_judgement(raw: &str) -> Option<(bool, String)> {
     } else {
         reply
     };
-    Some((correct, reply))
+    Some(Judged::Answer { correct, reply })
 }
 
 /// One clean spoken question: "What packs?" stays a question, "Explain how
@@ -895,8 +926,12 @@ mod tests {
         assert_eq!(q, ["Do you see how the author links the two?",
             "Can you explain why learning Rust is compared to a tough journey?"]);
         assert_eq!(parse_lesson("Just a statement. Nothing asked."), None);
-        assert_eq!(parse_judgement("{\"correct\": true, \"reply\": \"Right.\"}"), Some((true, "Right.".into())));
-        assert_eq!(parse_judgement("{\"correct\": \"false\"}"), Some((false, "Not quite.".into())));
+        let answer = |correct, reply: &str| Some(Judged::Answer { correct, reply: reply.into() });
+        assert_eq!(parse_judgement("{\"correct\": true, \"reply\": \"Right.\"}"), answer(true, "Right."));
+        assert_eq!(parse_judgement("{\"answering\": true, \"correct\": \"false\"}"), answer(false, "Not quite."));
+        assert_eq!(parse_judgement("{\"answering\": false}"), Some(Judged::Aside));
+        assert_eq!(parse_judgement("{\"answering\": \"no\", \"correct\": false}"), Some(Judged::Aside));
+        assert_eq!(parse_judgement("{\"answering\": true}"), None);
         assert_eq!(parse_judgement("no json"), None);
     }
 

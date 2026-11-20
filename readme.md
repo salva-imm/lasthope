@@ -123,7 +123,8 @@ These spoken phrases are commands instead:
 She lives in [`persona.md`](persona.md): a calm, dark, commanding mentor who
 speaks in the language of ritual (the great work, oaths, vigils, seals) and
 pushes you toward your work, the gym and other people rather than toward
-talking to her. The file is re-read on every reply, so edits apply
+talking to her. You can still talk to her of anything; she follows you to other
+subjects and turns you back to the work only when talk is standing in for it. The file is re-read on every reply, so edits apply
 immediately. HTML comments in it are notes and are not sent.
 
 Whatever the model returns, the code keeps her spoken: reasoning blocks,
@@ -209,8 +210,10 @@ you, one page at a time.
   she has answered, she asks again up to two old questions you got wrong (never ones asked
   in the last twelve hours) and shows their pages. A question counts as learned once you
   answer it right.
-- While a question waits, your words are taken as the answer; spoken commands still work,
-  and "leave the page" closes the book. Only PDFs for now (no EPUB).
+- While a question waits, the judging call first decides whether what you said answers it.
+  Anything else (another subject, a question of your own) gets an ordinary reply, is not
+  graded, and the question stays open for later. Spoken commands still work, and "leave the
+  page" closes the book. Only PDFs for now (no EPUB).
 
 ### The web UI
 

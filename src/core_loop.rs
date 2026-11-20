@@ -370,7 +370,8 @@ struct Question {
 /// A grimoire request in flight.
 enum Call {
     Lesson(Page),
-    Judge(Question),
+    /// Her question, and what I said to it.
+    Judge(Question, String),
 }
 
 /// Which page to read.
@@ -783,20 +784,25 @@ impl Core {
                 if let Err(e) = self.memory.add_message(self.session, Speaker::Me, text).await {
                     self.error("saving what you said", e);
                 }
-                self.last_heard = text.to_string();
-                let logged = self.heard_report(text).await;
-                let mut actions = self.rite.heard(text);
-                if let Some(situation) = logged {
-                    // she acknowledges the vigil, unless the rite wants something else
-                    for a in &mut actions {
-                        if *a == Action::Reply(Situation::Conversation) {
-                            *a = Action::Reply(situation.clone());
-                        }
-                    }
-                }
-                self.apply(actions).await
+                self.converse(text).await
             }
         }
+    }
+
+    /// What I said (already saved) goes to the rite, and she answers it.
+    async fn converse(&mut self, text: &str) -> Flow {
+        self.last_heard = text.to_string();
+        let logged = self.heard_report(text).await;
+        let mut actions = self.rite.heard(text);
+        if let Some(situation) = logged {
+            // she acknowledges the vigil, unless the rite wants something else
+            for a in &mut actions {
+                if *a == Action::Reply(Situation::Conversation) {
+                    *a = Action::Reply(situation.clone());
+                }
+            }
+        }
+        self.apply(actions).await
     }
 
     async fn on_command(&mut self, cmd: Command) -> Flow {
@@ -1065,8 +1071,7 @@ impl Core {
         self.task = None;
         let done = match (self.call.take(), done) {
             (Some((call_id, call)), Done::Reply(reply)) if call_id == id => {
-                self.reading_reply(call, reply).await;
-                return Flow::Continue;
+                return self.reading_reply(call, reply).await;
             }
             (_, done) => done,
         };
@@ -1400,12 +1405,12 @@ impl Core {
         );
         let id = self.next_turn(Turn::Thinking);
         self.replying_to = None;
-        self.call = Some((id, Call::Judge(question)));
+        self.call = Some((id, Call::Judge(question, text.to_string())));
         self.spawn_chat(id, messages, grimoire::JUDGE_SAMPLING);
     }
 
     /// The model's lesson or judgement came back.
-    async fn reading_reply(&mut self, call: Call, reply: Result<String>) {
+    async fn reading_reply(&mut self, call: Call, reply: Result<String>) -> Flow {
         let raw = match reply {
             Ok(raw) => Some(raw),
             Err(e) => {
@@ -1419,7 +1424,8 @@ impl Core {
                     if let Some(raw) = &raw {
                         self.emit(Event::Error { message: format!("unreadable lesson: {raw:?}") });
                     }
-                    return self.failed_reading("The page would not open to me. Ask for it again.");
+                    self.failed_reading("The page would not open to me. Ask for it again.");
+                    return Flow::Continue;
                 };
                 let mut queue = VecDeque::new();
                 for text in questions {
@@ -1429,7 +1435,8 @@ impl Core {
                     }
                 }
                 let Some(first) = queue.pop_front() else {
-                    return self.failed_reading("The page would not open to me. Ask for it again.");
+                    self.failed_reading("The page would not open to me. Ask for it again.");
+                    return Flow::Continue;
                 };
                 let line = format!("{} First question: {}", persona::clean_reply(&explanation), first.text);
                 if let Some(quiz) = self.quiz.as_mut() {
@@ -1439,8 +1446,22 @@ impl Core {
                 self.publish_reading();
                 self.say(line).await;
             }
-            Call::Judge(question) => {
-                let Some((correct, verdict)) = raw.as_deref().and_then(grimoire::parse_judgement) else {
+            Call::Judge(question, said) => {
+                let judged = raw.as_deref().and_then(grimoire::parse_judgement);
+                if judged == Some(grimoire::Judged::Aside) {
+                    // not an answer: she talks of it as ever, and the question waits
+                    if let Err(e) = self.memory.unanswer_question(question.id).await {
+                        self.error("reopening the question", e);
+                    }
+                    if let Some(quiz) = self.quiz.as_mut() {
+                        quiz.current = Some(question);
+                    }
+                    self.publish_reading();
+                    self.notice("not an answer to her question; it stays open");
+                    self.turn = Turn::Idle; // the judging turn is over: her reply is a new one
+                    return self.converse(&said).await;
+                }
+                let Some(grimoire::Judged::Answer { correct, reply: verdict }) = judged else {
                     if let Some(raw) = &raw {
                         self.emit(Event::Error { message: format!("unreadable judgement: {raw:?}") });
                     }
@@ -1449,7 +1470,8 @@ impl Core {
                         quiz.current = Some(question);
                     }
                     self.publish_reading();
-                    return self.failed_reading("I could not weigh that answer. Give it once more.");
+                    self.failed_reading("I could not weigh that answer. Give it once more.");
+                    return Flow::Continue;
                 };
                 if let Err(e) = self.memory.judge_question(question.id, correct, &verdict).await {
                     self.error("saving the verdict", e);
@@ -1477,6 +1499,7 @@ impl Core {
                 self.say(line).await;
             }
         }
+        Flow::Continue
     }
 
     /// A grimoire request failed: say so (not saved), and let her listen.
