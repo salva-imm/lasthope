@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 
-use crate::audio_in::Gate;
+use crate::audio_in::{Gate, MicChoice};
 use crate::config::Config;
 use crate::core_loop::{Core, Input};
 use crate::memory::Memory;
@@ -37,10 +37,11 @@ usage: lasthope [--text] [--no-ui] | --mics
            (no speech models are loaded)
   --no-ui  no web UI; the program ends when the rite closes
   --mics   list microphones and show which one she will listen through
+           (with MIC_DEVICE; a mic chosen in the Chamber or with /mic overrides it)
 
 settings (environment or .env): LLM_BASE_URL, LLM_API_KEY, LLM_MODEL
 optional: LLM_TEMPERATURE (0.8), PERSONA_PATH (./persona.md), DB_PATH (./lasthope.db),
-          MIC_DEVICE (part of a mic name, or \"default\"), END_OF_TURN_MS (1200),
+          MIC_DEVICE (part of a mic name, or \"default\"; the starting choice), END_OF_TURN_MS (1200),
           KOKORO_DIR (./kokoro-multi-lang-v1_0), MODELS_DIR (./models),
           UI_BIND (127.0.0.1; 0.0.0.0 lets your phone in, with a key), UI_PORT (7700), UI_DIR (./ui),
           BOOKS_DIR (./books: the grimoire's PDFs)
@@ -75,6 +76,12 @@ async fn main() -> Result<()> {
     let memory = Memory::open(&cfg.db_path).await?;
     let (handle, inputs) = core_loop::channel();
     let gate = Gate::new(false);
+    // a mic chosen in the Chamber (or with /mic) outlives restarts; MIC_DEVICE is the starting choice
+    let mics = MicChoice::new(match memory.setting(core_loop::MIC_SETTING).await? {
+        Some(v) if v == core_loop::MIC_AUTOMATIC => None,
+        Some(v) => Some(v),
+        None => cfg.mic_device.clone(),
+    });
     let pacer = core_loop::Pacer::default();
 
     let mouth: Arc<dyn Mouth> = if text_mode {
@@ -84,7 +91,7 @@ async fn main() -> Result<()> {
         eprintln!("loading voice and ears…");
         let voice = Voice::spawn(&cfg)?;
         let h = handle.clone();
-        audio_in::spawn(&cfg, gate.clone(), move |text| h.send(Input::Heard(text)))?;
+        audio_in::spawn(&cfg, gate.clone(), mics.clone(), move |text| h.send(Input::Heard(text)))?;
         eprintln!("models loaded in {:.1}s", t.elapsed().as_secs_f32());
         Arc::new(voice)
     };
@@ -93,6 +100,7 @@ async fn main() -> Result<()> {
         handle.clone(),
         pacer.clone(),
         memory.clone(),
+        mics.clone(),
         tokio::runtime::Handle::current(),
         text_mode,
     );
@@ -124,7 +132,7 @@ async fn main() -> Result<()> {
     let ui_up = want_ui && {
         let mode = if text_mode { "text" } else { "voice" };
         let books = cfg.books_dir.clone();
-        match web::start(cfg.ui_bind, cfg.ui_port, cfg.ui_dir.clone(), handle.clone(), memory.clone(), mode, books).await {
+        match web::start(cfg.ui_bind, cfg.ui_port, cfg.ui_dir.clone(), handle.clone(), memory.clone(), mode, books, mics.clone()).await {
             Ok(links) => {
                 for link in links {
                     eprintln!("chamber: {link}");
@@ -138,7 +146,9 @@ async fn main() -> Result<()> {
         }
     };
 
-    Core::new(llm, persona, memory, mouth, gate, pacer, handle, inputs, cfg.books_dir.clone()).run(ui_up).await;
+    Core::new(llm, persona, memory, mouth, gate, pacer, handle, inputs, cfg.books_dir.clone(), mics, text_mode)
+        .run(ui_up)
+        .await;
     let _ = tokio::time::timeout(Duration::from_secs(1), printer).await;
     Ok(())
 }

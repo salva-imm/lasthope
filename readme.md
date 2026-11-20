@@ -29,7 +29,14 @@ in the same turn, and the whole turn is transcribed at once.
 to phone-call quality (16 kHz, both directions), which makes her sound like a phone call,
 causes dropouts each time the mic opens or closes, and hurts recognition. So by default
 she listens through another mic (e.g. the MacBook's) when the default mic belongs to your
-headphones. `lasthope --mics` shows the choice; `MIC_DEVICE` overrides it.
+headphones.
+
+**Choosing the mic:** pick it live in the Chamber (*Her nature → Microphone*) or with
+`/mic` (list, then `/mic N`, `/mic auto`, `/mic default`, or part of a name). The change
+applies at once, even while she listens, and is kept across restarts. `MIC_DEVICE` is only
+the starting choice when none was saved. A chosen mic that is unplugged stays chosen:
+she listens through the automatic choice until it returns. `lasthope --mics` lists the
+mics with `MIC_DEVICE` only (it does not read the saved choice).
 
 ### Code layout
 
@@ -227,7 +234,8 @@ Open **http://localhost:7700** while she runs. Plain HTML, CSS and JavaScript se
   Close (or Open) the rite, the vigil with its length, a field to speak to her in writing,
   the great work (renamable), the seven seals of the chain, the due oath with Kept / Broken,
   what she knows of you (strike out a fact with two presses), and her nature: voice
-  (Kokoro's English voices), pace of speech, whether she speaks first.
+  (Kokoro's English voices), pace of speech, the microphone (automatic, the system
+  default, or one by name, with the one she listens through), whether she speaks first.
 - **Grimoire**: the shelf (each book with its pages and your place, scans and unreadable
   files marked; *Read this book*; *Read the shelf again* after adding or changing PDFs), the
   page viewer (back, onward, go to a page), *Read with her*: this page, the next unread, for
@@ -269,6 +277,7 @@ Type these in the terminal, in either mode:
 /page BOOK PAGE              read the page you choose;  /leave  closes the book
 /books   /book N             the shelf; make book N the one you read
 /reindex                     look through BOOKS_DIR again for new and changed PDFs
+/mic [N|auto|default|name]   list the microphones; choose one (at once, kept across restarts)
 ```
 
 Ctrl-C closes the session (summary included); a second Ctrl-C quits at once.

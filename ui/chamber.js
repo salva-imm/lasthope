@@ -134,6 +134,43 @@
     $('pace-value').textContent = `· ${s.settings.pace}%`;
     $('speaks-first').checked = s.settings.speaks_first;
     $('voice').disabled = $('pace').disabled = s.mode !== 'voice';
+    drawMics(s);
+  }
+
+  // The microphone: automatic, the system default, or one by name. A chosen
+  // mic that is not plugged in stays chosen, and the automatic one stands in.
+  function drawMics(s) {
+    const m = s.mics;
+    const select = $('mic');
+    const note = $('mic-note');
+    if (!m || m.error) {
+      select.replaceChildren(el('option', { value: '' }, 'No microphone found'));
+      select.disabled = true;
+      note.textContent = m && m.error ? `Cannot see the microphones: ${m.error}` : '';
+      return;
+    }
+    const choice = m.choice;
+    const isDefault = choice && choice.toLowerCase() === 'default';
+    const named = choice && !isDefault
+      ? (m.inputs.find((i) => i.name === choice) || m.inputs.find((i) => i.name.toLowerCase().includes(choice.toLowerCase())))
+      : null;
+    const options = [
+      el('option', { value: 'auto' }, 'Automatic (never a headset’s own mic)'),
+      el('option', { value: 'default' }, 'The system default'),
+      ...m.inputs.map((i) => el('option', { value: i.name }, i.system_default ? `${i.name} · system default` : i.name)),
+    ];
+    if (choice && !isDefault && !named) options.push(el('option', { value: choice }, `${choice} · not plugged in`));
+    if (document.activeElement !== select) {
+      select.replaceChildren(...options);
+      select.value = !choice ? 'auto' : isDefault ? 'default' : (named ? named.name : choice);
+    }
+    select.disabled = false;
+    const through = m.listening || 'no microphone';
+    note.textContent = s.mode !== 'voice'
+      ? 'Typed mode opens no mic; your choice is kept for voice mode.'
+      : m.missing
+        ? `Not plugged in: she listens through ${through} until it returns.`
+        : `She listens through ${through}${m.headset_avoided ? ' (your headset’s mic is passed over)' : ''}.`;
   }
 
   // Strike a fact on the second press, so a slip of the thumb costs nothing.
@@ -262,4 +299,10 @@
   $('pace').oninput = () => { $('pace-value').textContent = `· ${$('pace').value}%`; };
   $('pace').onchange = setVoice;
   $('speaks-first').onchange = (e) => send({ cmd: 'set_speaks_first', on: e.target.checked });
+  $('mic').onchange = (e) => {
+    const v = e.target.value;
+    send({ cmd: 'set_mic', mic: v === 'auto' ? null : v });
+    e.target.blur();
+  };
+  $('mic-look').onclick = refresh;
 })();

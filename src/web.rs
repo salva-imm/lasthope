@@ -27,6 +27,7 @@ use tokio::sync::broadcast::error::RecvError;
 
 use crate::core_loop::{Command, CoreHandle, Input};
 use crate::memory::Memory;
+use crate::audio_in::MicChoice;
 use crate::speech_out::VOICES;
 
 const COOKIE: &str = "lasthope_key";
@@ -44,9 +45,11 @@ struct App {
     mode: &'static str,
     /// The grimoire's PDFs.
     books_dir: PathBuf,
+    mics: MicChoice,
 }
 
 /// Start the server in the background. Returns the links to print.
+#[allow(clippy::too_many_arguments)]
 pub async fn start(
     bind: IpAddr,
     port: u16,
@@ -55,6 +58,7 @@ pub async fn start(
     memory: Memory,
     mode: &'static str,
     books_dir: PathBuf,
+    mics: MicChoice,
 ) -> Result<Vec<String>> {
     anyhow::ensure!(dir.join("index.html").exists(), "no web UI files in {}", dir.display());
     let key = if bind.is_loopback() { None } else { Some(ui_key(&memory).await?) };
@@ -68,7 +72,7 @@ pub async fn start(
         links.push(format!("http://{ip}:{port}/?key={key}  (other devices on your network)"));
     }
 
-    let app = App { handle, memory, dir, key, mode, books_dir };
+    let app = App { handle, memory, dir, key, mode, books_dir, mics };
     let router = Router::new()
         .route("/api/chamber", get(chamber))
         .route("/api/sessions", get(sessions))
@@ -264,6 +268,12 @@ async fn chamber(State(app): State<App>) -> Result<Json<Value>, Failure> {
     let upcoming = m.upcoming_oath(today).await?;
     let focus = m.focus_on(today).await?;
     let voice: i32 = m.setting("voice").await?.and_then(|v| v.parse().ok()).unwrap_or(crate::speech_out::DEFAULT_VOICE);
+    let choice = app.mics.get();
+    let mics = match tokio::task::spawn_blocking(move || crate::audio_in::mics(choice.as_deref())).await {
+        Ok(Ok(found)) => json!(found),
+        Ok(Err(e)) => json!({ "error": format!("{e:#}") }),
+        Err(e) => json!({ "error": e.to_string() }),
+    };
     let speed: f32 = m.setting("speed").await?.and_then(|v| v.parse().ok()).unwrap_or(crate::speech_out::DEFAULT_SPEED);
     Ok(Json(json!({
         "mode": app.mode,
@@ -281,6 +291,7 @@ async fn chamber(State(app): State<App>) -> Result<Json<Value>, Failure> {
             "pace": (speed * 100.0).round() as u32,
             "speaks_first": m.speaks_first().await?,
         },
+        "mics": mics,
         "voices": VOICES.iter().map(|(id, name)| json!({ "id": id, "name": name })).collect::<Vec<_>>(),
     })))
 }

@@ -12,6 +12,7 @@ use std::sync::atomic::AtomicBool;
 use anyhow::{Result, anyhow};
 use tokio::sync::{broadcast, oneshot};
 
+use crate::audio_in::{self, MicChoice};
 use crate::core_loop::{Command, CoreHandle, Event, Input, Pacer, State};
 use crate::grimoire::Pick;
 use crate::memory::{Memory, Speaker};
@@ -33,6 +34,7 @@ commands:
   /page BOOK PAGE         read the page you choose;  /leave  closes the book
   /books                  the shelf;  /book N  makes book N the one you read
   /reindex                look through BOOKS_DIR again for new and changed PDFs
+  /mic [N|auto|default|name]   the microphones; choose one (at once, kept across restarts)
   /end                    close the rite (she asks tomorrow's oath; /end again skips it)
   /open                   open the next rite (when the web UI keeps her running)
   /help";
@@ -62,12 +64,15 @@ enum Query {
     Mission,
     Search(String),
     Books,
+    Mics,
 }
 
 #[derive(Debug, PartialEq, Eq)]
 enum Typed {
     Command(Command),
     Query(Query),
+    /// `/mic N`: the Nth microphone of `/mic`.
+    MicNumber(usize),
 }
 
 fn parse_command(line: &str) -> Option<Result<Typed, String>> {
@@ -139,12 +144,24 @@ fn parse_command(line: &str) -> Option<Result<Typed, String>> {
             Err(_) => Err("usage: /book N   (numbers from /books)".to_string()),
         },
         ("reindex", "") => cmd(Command::Reindex),
+        ("mic" | "mics", "") => Ok(Typed::Query(Query::Mics)),
+        ("mic", "auto") => cmd(Command::SetMic { mic: None }),
+        ("mic", t) => match t.parse() {
+            Ok(0) => Err("usage: /mic N   (numbers from /mic)".to_string()),
+            Ok(n) => Ok(Typed::MicNumber(n)),
+            Err(_) => cmd(Command::SetMic { mic: Some(t.to_string()) }),
+        },
         _ => Err(COMMANDS_HELP.to_string()),
     })
 }
 
-async fn answer(memory: &Memory, query: Query) -> anyhow::Result<String> {
+async fn answer(memory: &Memory, mics: &MicChoice, query: Query) -> anyhow::Result<String> {
     Ok(match query {
+        Query::Mics => {
+            let choice = mics.get();
+            let listed = tokio::task::spawn_blocking(move || audio_in::describe_mics(choice.as_deref())).await??;
+            format!("{listed}\n/mic N chooses one, /mic auto lets her choose, /mic default takes the system's")
+        }
         Query::Mission => format!("the great work: {}", memory.mission().await?),
         Query::Facts => {
             let facts = memory.facts().await?;
@@ -219,6 +236,7 @@ pub fn spawn_stdin(
     handle: CoreHandle,
     pacer: Pacer,
     memory: Memory,
+    mics: MicChoice,
     runtime: tokio::runtime::Handle,
     end_on_eof: bool,
 ) {
@@ -237,11 +255,18 @@ pub fn spawn_stdin(
                     Some(Ok(Typed::Query(q))) => {
                         // answer once what was said before has been handled
                         pacer.wait_free();
-                        match runtime.block_on(answer(&memory, q)) {
+                        match runtime.block_on(answer(&memory, &mics, q)) {
                             Ok(text) => eprintln!("{text}"),
                             Err(e) => eprintln!("  ! {e:#}"),
                         }
                     }
+                    Some(Ok(Typed::MicNumber(n))) => match audio_in::mics(None) {
+                        Ok(found) => match found.inputs.get(n - 1) {
+                            Some(input) => handle.command(Command::SetMic { mic: Some(input.name.clone()) }),
+                            None => eprintln!("there is no microphone {n} (see /mic)"),
+                        },
+                        Err(e) => eprintln!("  ! {e:#}"),
+                    },
                     Some(Err(help)) => eprintln!("{help}"),
                     None => {
                         if interactive && !pacer.is_free() {
@@ -359,6 +384,11 @@ mod tests {
         assert_eq!(parse_command("/page 2 41"), cmd(Command::ReadPage { book: 2, page: 41 }));
         assert!(matches!(parse_command("/page 2"), Some(Err(_))));
         assert_eq!(parse_command("/book 3"), cmd(Command::SetBook { book: 3 }));
+        assert_eq!(parse_command("/mic"), Some(Ok(Typed::Query(Query::Mics))));
+        assert_eq!(parse_command("/mic 2"), Some(Ok(Typed::MicNumber(2))));
+        assert_eq!(parse_command("/mic auto"), cmd(Command::SetMic { mic: None }));
+        assert_eq!(parse_command("/mic MacBook"), cmd(Command::SetMic { mic: Some("MacBook".into()) }));
+        assert!(matches!(parse_command("/mic 0"), Some(Err(_))));
         assert_eq!(parse_command("talk to me"), None);
     }
 }

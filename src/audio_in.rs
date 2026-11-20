@@ -10,7 +10,9 @@
 //!
 //! Bluetooth headsets drop to phone-call quality (16 kHz, both directions)
 //! while their mic is open, so by default the headset's own mic is avoided
-//! when another one (e.g. the laptop's) exists. MIC_DEVICE overrides this.
+//! when another one (e.g. the laptop's) exists. The mic can be chosen live
+//! (`MicChoice`: the Chamber's picker, `/mic`); MIC_DEVICE is only the
+//! starting choice when none was saved.
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc as std_mpsc;
@@ -26,6 +28,8 @@ use sherpa_onnx::{
     LinearResampler, OfflineRecognizer, OfflineRecognizerConfig, VadModelConfig,
     VoiceActivityDetector,
 };
+
+use serde::Serialize;
 
 use crate::config::Config;
 
@@ -66,6 +70,37 @@ impl Gate {
     }
 }
 
+/// Which mic she should listen through, shared between the core (which
+/// changes it) and the mic thread (which reopens the input when it changes).
+/// `None` chooses automatically; "default" is the system default; any other
+/// text picks the first input whose name contains it.
+#[derive(Clone)]
+pub struct MicChoice(Arc<Mutex<(Option<String>, u64)>>);
+
+impl MicChoice {
+    pub fn new(pref: Option<String>) -> Self {
+        Self(Arc::new(Mutex::new((pref, 0))))
+    }
+
+    pub fn get(&self) -> Option<String> {
+        self.0.lock().unwrap().0.clone()
+    }
+
+    pub fn set(&self, pref: Option<String>) {
+        let mut g = self.0.lock().unwrap();
+        g.0 = pref;
+        g.1 += 1;
+    }
+
+    fn snapshot(&self) -> (Option<String>, u64) {
+        self.0.lock().unwrap().clone()
+    }
+
+    fn generation(&self) -> u64 {
+        self.0.lock().unwrap().1
+    }
+}
+
 pub(crate) struct Ears {
     asr: OfflineRecognizer,
     vad: VoiceActivityDetector,
@@ -87,11 +122,8 @@ enum Chunk {
 /// VAD and Whisper. Slow transcription can therefore never lose speech.
 ///
 /// Set `LASTHOPE_DEBUG_AUDIO=1` to save every turn to `debug-audio/`.
-pub fn spawn(cfg: &Config, gate: Gate, on_heard: impl Fn(String) + Send + 'static) -> Result<()> {
-    // fail fast on a MIC_DEVICE that matches nothing
-    choose_input(cfg.mic_device.as_deref())?;
+pub fn spawn(cfg: &Config, gate: Gate, choice: MicChoice, on_heard: impl Fn(String) + Send + 'static) -> Result<()> {
     let models = cfg.models_dir.clone();
-    let mic_pref = cfg.mic_device.clone();
     let turn_gap = (cfg.end_of_turn.as_secs_f64() * SAMPLE_RATE as f64) as i64;
     let debug_dir = std::env::var("LASTHOPE_DEBUG_AUDIO")
         .ok()
@@ -115,17 +147,20 @@ pub fn spawn(cfg: &Config, gate: Gate, on_heard: impl Fn(String) + Send + 'stati
     init_rx.recv().context("transcriber thread died while loading")??;
     thread::Builder::new()
         .name("mic".into())
-        .spawn(move || capture_loop(&gate, &tx, mic_pref.as_deref()))?;
+        .spawn(move || capture_loop(&gate, &tx, &choice))?;
     Ok(())
 }
 
 /// Mic thread: open the mic while the gate is open, forward 50 ms mono chunks.
-fn capture_loop(gate: &Gate, tx: &std_mpsc::Sender<Chunk>, mic_pref: Option<&str>) {
+/// A new choice of mic closes the input at once and opens the chosen one.
+fn capture_loop(gate: &Gate, tx: &std_mpsc::Sender<Chunk>, choice: &MicChoice) {
     let mut announced = None;
+    let mut warned = None;
     loop {
         gate.wait_open();
         // chosen on every opening, so plugging headphones in or out is followed
-        let (mut mic, name) = match open_mic(mic_pref) {
+        let (pref, generation) = choice.snapshot();
+        let (mut mic, name, missing) = match open_mic(pref.as_deref()) {
             Ok(m) => m,
             Err(e) => {
                 eprintln!("  ! microphone: {e:#}; retrying in 2s");
@@ -133,6 +168,10 @@ fn capture_loop(gate: &Gate, tx: &std_mpsc::Sender<Chunk>, mic_pref: Option<&str
                 continue;
             }
         };
+        if missing && warned != pref {
+            eprintln!("  ! no microphone matches {:?}; listening through {name} until it returns", pref.as_deref().unwrap_or(""));
+        }
+        warned = if missing { pref.clone() } else { None };
         let channels = mic.channels().get() as usize;
         let rate = mic.sample_rate().get();
         let now = (name, rate, channels);
@@ -153,7 +192,7 @@ fn capture_loop(gate: &Gate, tx: &std_mpsc::Sender<Chunk>, mic_pref: Option<&str
                 }
                 mono.push(sum / channels as f32);
             }
-            if !gate.is_open() {
+            if !gate.is_open() || choice.generation() != generation {
                 break;
             }
             if tx.send(Chunk::Audio { samples: mono, rate }).is_err() {
@@ -171,62 +210,110 @@ fn device_name(d: &rodio::cpal::Device) -> Option<String> {
     d.description().ok().map(|d| d.name().to_string())
 }
 
-/// Which mic to open. `None` means the system default.
-/// - MIC_DEVICE=default: the system default.
-/// - MIC_DEVICE=<text>: the first input whose name contains it.
-/// - unset: the default, unless it is the same device as the default output
-///   (a headset) and another input exists: then that other input.
-fn choose_input(pref: Option<&str>) -> Result<Option<Input>> {
+/// Which mic to open (`None` in the result: the system default), and
+/// whether the preferred mic was missing (then the automatic choice is used).
+/// - "default": the system default.
+/// - other text: the first input whose name contains it.
+/// - no preference: the default, unless it is the same device as the default
+///   output (a headset) and another input exists: then that other input.
+fn choose_input(pref: Option<&str>) -> Result<(Option<Input>, bool)> {
     let inputs = available_inputs()?;
     match pref {
-        Some(p) if p.eq_ignore_ascii_case("default") => Ok(None),
+        Some(p) if p.eq_ignore_ascii_case("default") => Ok((None, false)),
         Some(p) => {
             let wanted = p.to_lowercase();
-            let names: Vec<String> = inputs.iter().map(|i| i.to_string()).collect();
-            inputs
-                .into_iter()
-                .find(|i| i.to_string().to_lowercase().contains(&wanted))
-                .map(Some)
-                .ok_or_else(|| anyhow!("no microphone matches MIC_DEVICE={p:?}; available: {}", names.join(", ")))
-        }
-        None => {
-            let host = rodio::cpal::default_host();
-            let default_in = host.default_input_device().and_then(|d| device_name(&d));
-            let default_out = host.default_output_device().and_then(|d| device_name(&d));
-            if default_in.is_some() && default_in == default_out {
-                Ok(inputs.into_iter().find(|i| Some(i.to_string()) != default_in))
-            } else {
-                Ok(None)
+            let exact = inputs.iter().position(|i| i.to_string().to_lowercase() == wanted);
+            let near = || inputs.iter().position(|i| i.to_string().to_lowercase().contains(&wanted));
+            match exact.or_else(near) {
+                Some(i) => Ok((Some(inputs.into_iter().nth(i).expect("found")), false)),
+                None => Ok((automatic(inputs), true)),
             }
         }
+        None => Ok((automatic(inputs), false)),
     }
+}
+
+fn automatic(inputs: Vec<Input>) -> Option<Input> {
+    let host = rodio::cpal::default_host();
+    let default_in = host.default_input_device().and_then(|d| device_name(&d));
+    let default_out = host.default_output_device().and_then(|d| device_name(&d));
+    if default_in.is_some() && default_in == default_out {
+        inputs.into_iter().find(|i| Some(i.to_string()) != default_in)
+    } else {
+        None
+    }
+}
+
+/// The microphones on this machine, and which one she listens through.
+#[derive(Clone, Debug, Serialize)]
+pub struct Mics {
+    pub inputs: Vec<MicInput>,
+    /// The choice as stored: None is automatic, "default" the system default.
+    pub choice: Option<String>,
+    /// The mic she listens through with that choice, right now.
+    pub listening: Option<String>,
+    /// The chosen mic is not plugged in: the automatic choice stands in.
+    pub missing: bool,
+    /// The automatic choice passed over the headset's own mic.
+    pub headset_avoided: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct MicInput {
+    pub name: String,
+    pub system_default: bool,
+}
+
+/// Look at the inputs now (this asks the system: call it off the async threads).
+pub fn mics(choice: Option<&str>) -> Result<Mics> {
+    let default_in = rodio::cpal::default_host().default_input_device().and_then(|d| device_name(&d));
+    let inputs = available_inputs()?
+        .into_iter()
+        .map(|i| {
+            let name = i.to_string();
+            MicInput { system_default: Some(&name) == default_in.as_ref(), name }
+        })
+        .collect();
+    let (chosen, missing) = choose_input(choice)?;
+    let listening = chosen.map(|i| i.to_string()).or(default_in.clone());
+    let automatic = choice.is_none() || missing;
+    Ok(Mics {
+        inputs,
+        choice: choice.map(str::to_string),
+        headset_avoided: automatic && listening.is_some() && listening != default_in,
+        listening,
+        missing,
+    })
 }
 
 /// For `--mics`: list inputs and say which one would be used.
 pub fn describe_mics(pref: Option<&str>) -> Result<String> {
-    let host = rodio::cpal::default_host();
-    let default_in = host.default_input_device().and_then(|d| device_name(&d));
-    let default_out = host.default_output_device().and_then(|d| device_name(&d));
+    let m = mics(pref)?;
     let mut out = String::from("microphones:\n");
-    for input in available_inputs()? {
-        let name = input.to_string();
-        let tag = if Some(&name) == default_in.as_ref() { "  (system default)" } else { "" };
-        out.push_str(&format!("  {name}{tag}\n"));
+    for (n, input) in m.inputs.iter().enumerate() {
+        let tag = if input.system_default { "  (system default)" } else { "" };
+        out.push_str(&format!("  {}  {}{tag}\n", n + 1, input.name));
     }
-    out.push_str(&format!("speaker: {}\n", default_out.as_deref().unwrap_or("none")));
-    let chosen = match choose_input(pref)? {
-        Some(i) => i.to_string(),
-        None => default_in.unwrap_or_else(|| "none".into()),
-    };
-    out.push_str(&format!("she will listen through: {chosen}"));
-    if pref.is_none() && Some(&chosen) != host.default_input_device().and_then(|d| device_name(&d)).as_ref() {
+    let speaker = rodio::cpal::default_host().default_output_device().and_then(|d| device_name(&d));
+    out.push_str(&format!("speaker: {}\n", speaker.as_deref().unwrap_or("none")));
+    out.push_str(&format!(
+        "chosen: {}\n",
+        match m.choice.as_deref() {
+            None => "automatic".to_string(),
+            Some(c) if c.eq_ignore_ascii_case("default") => "the system default".to_string(),
+            Some(c) => format!("{c:?}{}", if m.missing { " (not plugged in)" } else { "" }),
+        }
+    ));
+    out.push_str(&format!("she listens through: {}", m.listening.as_deref().unwrap_or("none")));
+    if m.headset_avoided {
         out.push_str("  (the default mic is your headset's: avoided, it would drop the headset to call quality)");
     }
     Ok(out)
 }
 
-fn open_mic(pref: Option<&str>) -> Result<(Microphone, String)> {
-    let (builder, name) = match choose_input(pref)? {
+fn open_mic(pref: Option<&str>) -> Result<(Microphone, String, bool)> {
+    let (input, missing) = choose_input(pref)?;
+    let (builder, name) = match input {
         Some(input) => {
             let name = input.to_string();
             (MicrophoneBuilder::new().device(input)?, name)
@@ -244,7 +331,7 @@ fn open_mic(pref: Option<&str>) -> Result<(Microphone, String)> {
         .prefer_channel_counts([1.try_into().unwrap()])
         .prefer_sample_rates([16_000.try_into().unwrap()])
         .open_stream()?;
-    Ok((mic, name))
+    Ok((mic, name, missing))
 }
 
 impl Ears {

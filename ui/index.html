@@ -209,6 +209,14 @@
       <label for="pace">Pace of speech <span id="pace-value"></span></label>
       <input id="pace" type="range" min="70" max="130" step="5" value="100">
     </div>
+    <div class="field">
+      <label for="mic">Microphone</label>
+      <select id="mic"></select>
+      <div class="row-between">
+        <span class="small muted" id="mic-note" aria-live="polite"></span>
+        <button type="button" class="btn quiet small-text" id="mic-look">Look again</button>
+      </div>
+    </div>
     <label class="check">
       <input type="checkbox" id="speaks-first">
       <span>She speaks first</span>

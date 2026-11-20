@@ -26,7 +26,7 @@ use tokio::sync::{broadcast, mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
 
-use crate::audio_in::Gate;
+use crate::audio_in::{self, Gate, MicChoice};
 use crate::grimoire::{self, Page, Pick, ReadCmd, reading_command};
 use crate::llm::{self, ChatMessage, LlmClient, Sampling, Trouble};
 use crate::memory::{Memory, Speaker, VigilSource};
@@ -35,6 +35,9 @@ use crate::rite::{Action, Rite, Situation};
 use crate::speech_out::Mouth;
 use crate::timer::{DEFAULT_VIGIL, MAX_MINUTES, Vigil, VigilCmd, vigil_command, vigil_report};
 
+/// The settings key of the chosen mic, and its value for "choose automatically".
+pub const MIC_SETTING: &str = "mic";
+pub const MIC_AUTOMATIC: &str = "auto";
 /// Facts sent with each request (the most recent ones).
 const MAX_FACTS_IN_PROMPT: usize = 40;
 /// Past lines recalled by full-text search for each reply.
@@ -107,6 +110,12 @@ pub enum Command {
     SetBook { book: i64 },
     /// Look through BOOKS_DIR again for new and changed PDFs.
     Reindex,
+    /// The mic she listens through: None chooses automatically, "default" is
+    /// the system default, other text the first mic whose name contains it.
+    SetMic {
+        #[serde(default)]
+        mic: Option<String>,
+    },
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -419,6 +428,9 @@ pub struct Core {
     last_bell: Option<Instant>,
     books_dir: PathBuf,
     indexing: Arc<AtomicBool>,
+    mics: MicChoice,
+    /// Typed mode: no mic is open (a chosen one is kept for voice mode).
+    text_mode: bool,
     quiz: Option<Quiz>,
     /// A lesson or a judgement in flight, with its turn id.
     call: Option<(u64, Call)>,
@@ -440,6 +452,8 @@ impl Core {
         handle: CoreHandle,
         inputs: mpsc::UnboundedReceiver<Input>,
         books_dir: PathBuf,
+        mics: MicChoice,
+        text_mode: bool,
     ) -> Self {
         let (done_tx, done_rx) = mpsc::unbounded_channel();
         Self {
@@ -473,6 +487,8 @@ impl Core {
             last_bell: None,
             books_dir,
             indexing: Arc::new(AtomicBool::new(false)),
+            mics,
+            text_mode,
             quiz: None,
             call: None,
             review_due: false,
@@ -862,8 +878,45 @@ impl Core {
             Command::LeavePage => self.leave_page(false),
             Command::SetBook { book } => self.set_book(book).await,
             Command::Reindex => self.reindex(),
+            Command::SetMic { mic } => self.set_mic(mic).await,
         }
         Flow::Continue
+    }
+
+    /// Choose the mic; the mic thread reopens on it at once if it is listening.
+    async fn set_mic(&mut self, mic: Option<String>) {
+        let mic = mic.map(|m| m.trim().to_string()).filter(|m| !m.is_empty() && !m.eq_ignore_ascii_case("auto"));
+        let wanted = mic.clone();
+        let found = tokio::task::spawn_blocking(move || audio_in::mics(wanted.as_deref())).await;
+        let mics = match found {
+            Ok(Ok(m)) => m,
+            Ok(Err(e)) => return self.error("looking at the microphones", e),
+            Err(e) => return self.error("looking at the microphones", anyhow!(e)),
+        };
+        if mics.missing {
+            let names: Vec<&str> = mics.inputs.iter().map(|i| i.name.as_str()).collect();
+            return self.notice(format!(
+                "no microphone matches {:?}; there are: {}",
+                mic.as_deref().unwrap_or(""),
+                names.join(", ")
+            ));
+        }
+        if let Err(e) = self.memory.set_setting(MIC_SETTING, mic.as_deref().unwrap_or(MIC_AUTOMATIC)).await {
+            self.error("saving the microphone", e);
+        }
+        self.mics.set(mic.clone());
+        let how = match mic.as_deref() {
+            None => "chosen automatically",
+            Some(m) if m.eq_ignore_ascii_case("default") => "the system default",
+            Some(_) => "chosen by you",
+        };
+        let through = mics.listening.as_deref().unwrap_or("no microphone");
+        self.notice(if self.text_mode {
+            format!("microphone kept for voice mode: {through} ({how}); typed mode opens none")
+        } else {
+            format!("she listens through {through} ({how})")
+        });
+        self.emit(Event::MemoryChanged);
     }
 
     async fn set_voice(&mut self, voice: i32, pace: u32) {
