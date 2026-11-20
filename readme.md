@@ -124,7 +124,9 @@ She lives in [`persona.md`](persona.md): a calm, dark, commanding mentor who
 speaks in the language of ritual (the great work, oaths, vigils, seals) and
 pushes you toward your work, the gym and other people rather than toward
 talking to her. You can still talk to her of anything; she follows you to other
-subjects and turns you back to the work only when talk is standing in for it. The file is re-read on every reply, so edits apply
+subjects and turns you back to the work only when talk is standing in for it. She also speaks
+of money: learning as the investment that compounds into better pay, freedom and an easier
+life. She gives no investment advice. The file is re-read on every reply, so edits apply
 immediately. HTML comments in it are notes and are not sent.
 
 Whatever the model returns, the code keeps her spoken: reasoning blocks,
