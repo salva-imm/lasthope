@@ -25,6 +25,13 @@ speaks, so she never hears herself.
 Your turn ends after 1.2 s of silence (`END_OF_TURN_MS`); shorter thinking pauses stay
 in the same turn, and the whole turn is transcribed at once.
 
+**Stopping mid-sentence:** if the words end where a sentence cannot (on "and", "because",
+"the", "my", "um", a comma or "…"), she keeps listening three seconds longer; go on and
+the whole sentence is heard as one. If you stay silent she asks for the rest ("Go on.",
+"Finish the thought.": fixed lines, no model call, not saved), and what you say next is
+joined to what you said before (a spoken command still stands alone). This reads the
+transcript, so it can miss a cut-off that Whisper rounds into a finished sentence.
+
 **Bluetooth headphones:** while a Bluetooth headset's own mic is open, macOS switches it
 to phone-call quality (16 kHz, both directions), which makes her sound like a phone call,
 causes dropouts each time the mic opens or closes, and hurts recognition. So by default

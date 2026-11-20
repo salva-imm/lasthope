@@ -38,6 +38,10 @@ use crate::timer::{DEFAULT_VIGIL, MAX_MINUTES, Vigil, VigilCmd, vigil_command, v
 /// The settings key of the chosen mic, and its value for "choose automatically".
 pub const MIC_SETTING: &str = "mic";
 pub const MIC_AUTOMATIC: &str = "auto";
+/// What she says when I stop mid-sentence (fixed lines: no model call, not saved).
+const GO_ON: &[&str] = &["Go on.", "Finish the thought.", "I am listening. Continue.", "And? Speak."];
+/// How long a broken-off sentence waits to be joined to the rest.
+const FRAGMENT_KEPT: Duration = Duration::from_secs(120);
 /// Facts sent with each request (the most recent ones).
 const MAX_FACTS_IN_PROMPT: usize = 40;
 /// Past lines recalled by full-text search for each reply.
@@ -175,6 +179,8 @@ pub struct VigilStatus {
 #[derive(Debug)]
 pub enum Input {
     Heard(String),
+    /// Speech that stopped mid-sentence and did not go on: she asks for the rest.
+    Trailed(String),
     Command(Command),
     /// Text mode stdin closed: end the session once the current turn is done.
     EndOfInput,
@@ -438,6 +444,9 @@ pub struct Core {
     review_due: bool,
     /// She has replied to something this session.
     replied: bool,
+    /// What I said before I broke off mid-sentence, and when.
+    fragment: Option<(String, Instant)>,
+    go_ons: usize,
 }
 
 impl Core {
@@ -493,6 +502,8 @@ impl Core {
             call: None,
             review_due: false,
             replied: false,
+            fragment: None,
+            go_ons: 0,
         }
     }
 
@@ -567,7 +578,7 @@ impl Core {
                     None | Some(Input::Shutdown | Input::EndOfInput) => return false,
                     Some(Input::Command(Command::OpenRite)) => return true,
                     Some(Input::Command(cmd)) => { self.on_command(cmd).await; }
-                    Some(Input::Heard(text)) => {
+                    Some(Input::Heard(text) | Input::Trailed(text)) => {
                         self.heard_since_refresh += 1;
                         self.notice(format!("the rite is closed; unheard: {text}"));
                     }
@@ -610,6 +621,7 @@ impl Core {
         self.last_heard.clear();
         self.quiz = None;
         self.call = None;
+        self.fragment = None;
         self.review_due = true;
         self.replied = false;
         self.publish_reading();
@@ -748,6 +760,10 @@ impl Core {
                 self.heard_since_refresh += 1;
                 self.on_heard(text.trim()).await
             }
+            Input::Trailed(text) => {
+                self.heard_since_refresh += 1;
+                self.on_trailed(text.trim()).await
+            }
             Input::Command(cmd) => self.on_command(cmd).await,
             Input::EndOfInput => {
                 self.end_when_idle = true;
@@ -755,6 +771,26 @@ impl Core {
             }
             Input::Shutdown => Flow::Quit,
         }
+    }
+
+    /// I stopped mid-sentence and said no more: she keeps what I said and
+    /// asks for the rest, which is joined to it when it comes.
+    async fn on_trailed(&mut self, text: &str) -> Flow {
+        if text.is_empty() || self.muted || self.state() != State::Listening {
+            return self.on_heard(text).await; // ignored there, with the reason
+        }
+        if !matches!(spoken_command(text), Spoken::Talk) {
+            return self.on_heard(text).await; // a command is whole as said
+        }
+        let whole = match self.fragment.take() {
+            Some((before, _)) => format!("{before} {text}"),
+            None => text.to_string(),
+        };
+        self.notice(format!("you stopped mid-sentence: \"{whole}…\"; she waits for the rest"));
+        self.fragment = Some((whole, Instant::now()));
+        self.go_ons += 1;
+        self.speak_line(GO_ON[self.go_ons % GO_ON.len()].to_string());
+        Flow::Continue
     }
 
     async fn on_heard(&mut self, text: &str) -> Flow {
@@ -766,6 +802,15 @@ impl Core {
                 self.state(), if self.muted { ", deafened" } else { "" }));
             return Flow::Continue;
         }
+        // the rest of a sentence I broke off: heard as one (a command stands alone)
+        let joined;
+        let text = match self.fragment.take() {
+            Some((before, at)) if at.elapsed() < FRAGMENT_KEPT && matches!(spoken_command(text), Spoken::Talk) => {
+                joined = format!("{before} {text}");
+                joined.as_str()
+            }
+            _ => text,
+        };
         self.emit(Event::UserSpoke { text: text.to_string() });
         match spoken_command(text) {
             Spoken::EndSession => {

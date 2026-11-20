@@ -7,6 +7,9 @@
 //! The VAD finds stretches of speech; a turn ends only after a longer silence
 //! (END_OF_TURN_MS, default 1.2 s), and the whole turn is transcribed at once,
 //! so thinking pauses don't split a sentence and Whisper gets full context.
+//! A turn that sounds cut off ("and…", "because the") is held a little longer
+//! (HOLD); if nothing more comes it is passed on as trailed off, and she asks
+//! for the rest.
 //!
 //! Bluetooth headsets drop to phone-call quality (16 kHz, both directions)
 //! while their mic is open, so by default the headset's own mic is avoided
@@ -115,14 +118,14 @@ enum Chunk {
 }
 
 /// Load the models and start listening. Every finished turn is passed to
-/// `on_heard`. Returns once the models are loaded (or failed to).
+/// `on_heard`, with `true` when it trailed off mid-sentence. Returns once the models are loaded (or failed to).
 ///
 /// Two threads: "mic" only drains the microphone (rodio keeps just 100 ms of
 /// audio and silently drops the rest if nobody reads it), "transcriber" runs
 /// VAD and Whisper. Slow transcription can therefore never lose speech.
 ///
 /// Set `LASTHOPE_DEBUG_AUDIO=1` to save every turn to `debug-audio/`.
-pub fn spawn(cfg: &Config, gate: Gate, choice: MicChoice, on_heard: impl Fn(String) + Send + 'static) -> Result<()> {
+pub fn spawn(cfg: &Config, gate: Gate, choice: MicChoice, on_heard: impl Fn(String, bool) + Send + 'static) -> Result<()> {
     let models = cfg.models_dir.clone();
     let turn_gap = (cfg.end_of_turn.as_secs_f64() * SAMPLE_RATE as f64) as i64;
     let debug_dir = std::env::var("LASTHOPE_DEBUG_AUDIO")
@@ -375,7 +378,7 @@ impl Ears {
     fn transcribe_loop(
         &self,
         rx: std_mpsc::Receiver<Chunk>,
-        on_heard: &dyn Fn(String),
+        on_heard: &dyn Fn(String, bool),
         turn_gap: i64,
         debug_dir: Option<PathBuf>,
     ) {
@@ -383,7 +386,9 @@ impl Ears {
         let mut history = History::default();
         let mut turn = Turn::default();
         let mut saved = 0u32;
-        let finish = |span: (i64, i64), history: &History, saved: &mut u32| {
+        // the turn held because it sounded unfinished, and what was heard of it
+        let mut held = None;
+        let transcribe = |span: (i64, i64), history: &History, saved: &mut u32| {
             let speech = history.slice(span.0, span.1);
             let started = Instant::now();
             let text = self.transcribe(speech);
@@ -402,9 +407,23 @@ impl Ears {
                 sherpa_onnx::write(&context.to_string_lossy(), lead_in, SAMPLE_RATE);
                 eprintln!("  (saved {}: {text:?})", heard.display());
             }
-            if let Some(text) = clean_transcript(&text) {
-                on_heard(text);
+            clean_transcript(&text)
+        };
+        // a finished turn: passed on, or held once more if it sounds cut off
+        type Held = Option<((i64, i64), Option<String>)>;
+        let finish = |span: (i64, i64), turn: &mut Turn, held: &mut Held, history: &History, saved: &mut u32| {
+            let (text, trailed) = match held.take() {
+                Some((was, text)) if was == span => (text, true), // nothing more came
+                _ => (transcribe(span, history, saved), false),
+            };
+            let Some(text) = text else { return };
+            if !trailed && sounds_unfinished(&text) {
+                eprintln!("  (sounds unfinished: \"{text}\"; listening on)");
+                turn.hold(span);
+                *held = Some((span, Some(text)));
+                return;
             }
+            on_heard(text, trailed);
         };
 
         for chunk in rx {
@@ -415,6 +434,7 @@ impl Ears {
                     self.vad.reset();
                     history = History::default();
                     turn = Turn::default();
+                    held = None;
                     if let Some((_, r)) = &resampler {
                         r.reset();
                     }
@@ -442,8 +462,9 @@ impl Ears {
                 turn.add_segment(segment.start(), segment.n() as i64);
                 self.vad.pop();
             }
-            if let Some(span) = turn.take_if_done(history.end(), self.vad.detected(), turn_gap) {
-                finish(span, &history, &mut saved);
+            let gap = if turn.held { turn_gap + HOLD } else { turn_gap };
+            if let Some(span) = turn.take_if_done(history.end(), self.vad.detected(), gap) {
+                finish(span, &mut turn, &mut held, &history, &mut saved);
             }
         }
         // input ended (tests): whatever was being said is a turn
@@ -452,8 +473,8 @@ impl Ears {
             turn.add_segment(segment.start(), segment.n() as i64);
             self.vad.pop();
         }
-        if let Some(span) = turn.take_if_done(i64::MAX, false, 0) {
-            finish(span, &history, &mut saved);
+        while let Some(span) = turn.take_if_done(i64::MAX, false, 0) {
+            finish(span, &mut turn, &mut held, &history, &mut saved);
         }
     }
 
@@ -473,6 +494,8 @@ const PREROLL: i64 = SAMPLE_RATE as i64 * 4 / 10; // 400 ms
 const CONTEXT: i64 = SAMPLE_RATE as i64 * 2;
 /// How much recent audio to keep (also the longest possible turn).
 const HISTORY: usize = SAMPLE_RATE as usize * 60;
+/// Extra silence allowed after a turn that sounds cut off, before she asks.
+const HOLD: i64 = SAMPLE_RATE as i64 * 3;
 /// A turn this long is transcribed even if speech continues.
 const MAX_TURN: i64 = SAMPLE_RATE as i64 * 45;
 
@@ -513,11 +536,14 @@ impl History {
 struct Turn {
     span: Option<(i64, i64)>,
     last_end: i64,
+    /// Taken but put back: it sounded unfinished, so it waits for more.
+    held: bool,
 }
 
 impl Turn {
     fn add_segment(&mut self, start: i64, len: i64) {
         let end = start + len;
+        self.held = false; // they went on: an ordinary pause ends it again
         match &mut self.span {
             Some((_, e)) => *e = (*e).max(end),
             None => self.span = Some(((start - PREROLL).max(self.last_end), end)),
@@ -531,12 +557,43 @@ impl Turn {
         let quiet_long_enough = !speaking && now.saturating_sub(end) >= gap;
         if quiet_long_enough || end - start >= MAX_TURN {
             self.span = None;
+            self.held = false;
             self.last_end = end;
             Some((start, end))
         } else {
             None
         }
     }
+}
+
+impl Turn {
+    /// Put a taken turn back, to wait HOLD longer for the rest of it.
+    fn hold(&mut self, span: (i64, i64)) {
+        self.span = Some(span);
+        self.held = true;
+    }
+}
+
+/// Does this turn stop mid-sentence? It ends in "...", a comma or a dash, or
+/// on a word that cannot end a sentence ("and", "because", "the", "um").
+/// A question or exclamation is finished, whatever its last word.
+pub fn sounds_unfinished(text: &str) -> bool {
+    const OPEN: &[&str] = &[
+        "and", "or", "but", "because", "cause", "cuz", "although", "though", "unless", "whether",
+        "if", "than", "the", "a", "an", "my", "your", "our", "their", "his", "of", "to", "from",
+        "into", "with", "about", "which", "whose", "where", "when", "while", "um", "uh", "uhm",
+        "umm", "er", "erm", "hmm", "also", "plus", "then",
+    ];
+    let t = text.trim();
+    if t.ends_with(['?', '!']) {
+        return false;
+    }
+    if t.ends_with("...") || t.ends_with(['…', ',', '-', '—', ':', ';']) {
+        return true;
+    }
+    let last = t.trim_end_matches(['.', '"', '\'']).rsplit(char::is_whitespace).next().unwrap_or("");
+    let last = last.trim_matches(|c: char| !c.is_alphanumeric() && c != '\'').to_lowercase();
+    OPEN.contains(&last.as_str())
 }
 
 /// Drop Whisper's non-speech markers ("[BLANK_AUDIO]", "(wind blowing)") and
@@ -589,7 +646,7 @@ mod tests {
             }
             drop(tx);
             let heard = std::cell::RefCell::new(Vec::new());
-            ears.transcribe_loop(rx, &|t| heard.borrow_mut().push(t), gap, None);
+            ears.transcribe_loop(rx, &|t, _| heard.borrow_mut().push(t), gap, None);
             let heard = heard.into_inner();
             println!("pause {pause_ms} ms -> {heard:?}");
             assert_eq!(heard.len(), expected, "{heard:?}");
@@ -644,6 +701,79 @@ mod tests {
         // next turn starts 0.1 s after the last: preroll stops at the previous end
         t.add_segment(4 * sec + sec / 2 + sec / 10, sec);
         assert_eq!(t.take_if_done(20 * sec, false, sec).unwrap().0, 4 * sec + sec / 2);
+    }
+
+    #[test]
+    fn unfinished_turns_are_held_longer() {
+        let sec = SAMPLE_RATE as i64;
+        let mut t = Turn::default();
+        t.add_segment(sec, sec); // speech 1-2 s
+        let span = t.take_if_done(3 * sec + sec / 2, false, sec).unwrap();
+        t.hold(span); // it sounded cut off
+        assert!(t.held);
+        assert_eq!(t.take_if_done(4 * sec, false, sec + HOLD), None, "still holding the same span");
+        assert_eq!(t.take_if_done(6 * sec, false, sec + HOLD), Some(span), "given up waiting: the same span");
+        // they went on: the turn grows and an ordinary pause ends it again
+        t.hold(span);
+        t.add_segment(3 * sec, sec);
+        assert!(!t.held);
+        assert_eq!(t.take_if_done(5 * sec + sec / 2, false, sec), Some((span.0, 4 * sec)));
+    }
+
+    #[test]
+    fn sentences_that_stop_midway() {
+        for cut in ["I was thinking about the.", "I want to learn more about", "So I went there and",
+            "Because...", "It is, um", "My plan for tomorrow is,", "I think the main problem with"] {
+            assert!(sounds_unfinished(cut), "{cut}");
+        }
+        for whole in ["I kept my oath.", "Thank you.", "Go on.", "What do you think of?", "I think so.",
+            "That's it.", "I did a vigil", "Read the next page.", "Me too!"] {
+            assert!(!sounds_unfinished(whole), "{whole}");
+        }
+    }
+
+    /// Kokoro's voice through the real VAD and Whisper: a sentence broken off
+    /// is held, and passed on as trailed only if nothing follows.
+    /// `cargo test --release trailing_off -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn trailing_off_is_held_then_passed_on() {
+        let voice = crate::speech_out::Engine::load(Path::new("./kokoro-multi-lang-v1_0")).unwrap();
+        let ears = Ears::load(Path::new("./models")).unwrap();
+        let (cut, rate) = voice.synth("Tomorrow I will study the storage layout and").unwrap().unwrap();
+        let (rest, _) = voice.synth("then write a contract that uses it.").unwrap().unwrap();
+        let quiet = |v: &[f32]| v.iter().map(|x| x * 0.08).collect::<Vec<f32>>();
+        let gap = (1.2 * SAMPLE_RATE as f64) as i64;
+        let silence = |secs: f32| vec![0.0; (rate as f32 * secs) as usize];
+        let run = |audio: Vec<f32>| {
+            let (tx, rx) = std_mpsc::channel();
+            for c in audio.chunks(rate as usize / 20) {
+                tx.send(Chunk::Audio { samples: c.to_vec(), rate }).unwrap();
+            }
+            drop(tx);
+            let heard = std::cell::RefCell::new(Vec::new());
+            ears.transcribe_loop(rx, &|t, trailed| heard.borrow_mut().push((t, trailed)), gap, None);
+            ears.vad.reset();
+            heard.into_inner()
+        };
+        // a 2 s pause after "the": longer than a turn, shorter than the hold
+        let mut went_on = silence(0.5);
+        went_on.extend(quiet(&cut));
+        went_on.extend(silence(2.0));
+        went_on.extend(quiet(&rest));
+        went_on.extend(silence(2.0));
+        let heard = run(went_on);
+        println!("went on -> {heard:?}");
+        assert_eq!(heard.len(), 1, "{heard:?}");
+        assert!(!heard[0].1 && heard[0].0.to_lowercase().contains("contract"), "{heard:?}");
+        // nothing follows: passed on, marked trailed
+        let mut stopped = silence(0.5);
+        stopped.extend(quiet(&cut));
+        stopped.extend(silence(6.0));
+        let heard = run(stopped);
+        println!("stopped -> {heard:?}");
+        assert_eq!(heard.len(), 1, "{heard:?}");
+        assert!(heard[0].1, "{heard:?}");
     }
 
     #[test]

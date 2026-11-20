@@ -91,7 +91,9 @@ async fn main() -> Result<()> {
         eprintln!("loading voice and ears…");
         let voice = Voice::spawn(&cfg)?;
         let h = handle.clone();
-        audio_in::spawn(&cfg, gate.clone(), mics.clone(), move |text| h.send(Input::Heard(text)))?;
+        audio_in::spawn(&cfg, gate.clone(), mics.clone(), move |text, trailed| {
+            h.send(if trailed { Input::Trailed(text) } else { Input::Heard(text) })
+        })?;
         eprintln!("models loaded in {:.1}s", t.elapsed().as_secs_f32());
         Arc::new(voice)
     };
