@@ -80,6 +80,11 @@ CREATE TABLE IF NOT EXISTS questions (
     answered_at TEXT
 );
 CREATE INDEX IF NOT EXISTS questions_first ON questions(first_id);
+-- questions I chose never to be asked again (the first asking's id)
+CREATE TABLE IF NOT EXISTS dropped_questions (
+    id          INTEGER PRIMARY KEY REFERENCES questions(id) ON DELETE CASCADE,
+    dropped_at  TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
+);
 "#;
 
 /// A page with less text than this is a title, a figure or a blank: never
@@ -149,6 +154,8 @@ pub struct Asked {
     /// Asked again: the id of the first asking.
     pub first_id: Option<i64>,
     pub asked_at: String,
+    /// I chose never to be asked it again.
+    pub dropped: bool,
 }
 
 /// A question I got wrong and have not yet answered right.
@@ -359,12 +366,12 @@ impl From<BookRow> for Book {
     }
 }
 
-type AskedRow = (i64, Option<i64>, Option<String>, i64, String, Option<String>, Option<bool>, Option<String>, Option<i64>, String);
+type AskedRow = (i64, Option<i64>, Option<String>, i64, String, Option<String>, Option<bool>, Option<String>, Option<i64>, String, bool);
 
 impl From<AskedRow> for Asked {
     fn from(r: AskedRow) -> Self {
-        let (id, book, title, page, question, answer, correct, judgement, first_id, asked_at) = r;
-        Self { id, book, title, page: page as u32, question, answer, correct, judgement, first_id, asked_at }
+        let (id, book, title, page, question, answer, correct, judgement, first_id, asked_at, dropped) = r;
+        Self { id, book, title, page: page as u32, question, answer, correct, judgement, first_id, asked_at, dropped }
     }
 }
 
@@ -621,6 +628,7 @@ impl Memory {
             "SELECT o.id, o.book_id, o.page, o.question FROM questions o
              WHERE o.first_id IS NULL AND o.correct = 0 AND o.book_id IS NOT NULL
                AND NOT EXISTS (SELECT 1 FROM questions r WHERE r.first_id = o.id AND r.correct = 1)
+               AND NOT EXISTS (SELECT 1 FROM dropped_questions d WHERE d.id = o.id)
                AND NOT EXISTS (SELECT 1 FROM questions r WHERE (r.id = o.id OR r.first_id = o.id)
                    AND r.asked_at >= datetime('now', 'localtime', '-12 hours'))
                AND EXISTS (SELECT 1 FROM pages p WHERE p.book_id = o.book_id AND p.page = o.page)
@@ -640,7 +648,8 @@ impl Memory {
     pub async fn questions(&self, book: Option<i64>, limit: u32) -> Result<Vec<Asked>> {
         let rows: Vec<AskedRow> = sqlx::query_as(
             "SELECT q.id, q.book_id, b.title, q.page, q.question, q.answer, q.correct, q.judgement,
-                    q.first_id, q.asked_at
+                    q.first_id, q.asked_at,
+                    EXISTS (SELECT 1 FROM dropped_questions d WHERE d.id = COALESCE(q.first_id, q.id))
              FROM questions q LEFT JOIN books b ON b.id = q.book_id
              WHERE ?1 IS NULL OR q.book_id = ?1
              ORDER BY q.id DESC LIMIT ?2",
@@ -650,6 +659,44 @@ impl Memory {
         .fetch_all(&self.pool)
         .await?;
         Ok(rows.into_iter().map(Asked::from).collect())
+    }
+
+    /// Never ask this question again (any asking of it: the first is marked).
+    pub async fn drop_question(&self, id: i64) -> Result<bool> {
+        let r = sqlx::query(
+            "INSERT OR IGNORE INTO dropped_questions (id)
+             SELECT COALESCE(first_id, id) FROM questions WHERE id = ?1",
+        )
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(r.rows_affected() > 0)
+    }
+
+    /// Ask it again after all.
+    pub async fn restore_question(&self, id: i64) -> Result<bool> {
+        let r = sqlx::query(
+            "DELETE FROM dropped_questions WHERE id = (SELECT COALESCE(first_id, id) FROM questions WHERE id = ?1)",
+        )
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(r.rows_affected() > 0)
+    }
+
+    /// Drop every question I got wrong and have not answered right since,
+    /// of one book or of all; returns how many.
+    pub async fn drop_missed(&self, book: Option<i64>) -> Result<u64> {
+        let r = sqlx::query(
+            "INSERT OR IGNORE INTO dropped_questions (id)
+             SELECT o.id FROM questions o
+             WHERE o.first_id IS NULL AND o.correct = 0 AND (?1 IS NULL OR o.book_id = ?1)
+               AND NOT EXISTS (SELECT 1 FROM questions r WHERE r.first_id = o.id AND r.correct = 1)",
+        )
+        .bind(book)
+        .execute(&self.pool)
+        .await?;
+        Ok(r.rows_affected())
     }
 
     /// (answered, right) over all questions.
@@ -713,6 +760,52 @@ pub fn reading_command(text: &str) -> Option<ReadCmd> {
         ["random", "page"] => Some(ReadCmd::Read(Pick::Random)),
         ["page", "oath"] | ["oath", "page"] => Some(ReadCmd::Read(Pick::Oath)),
         _ => None,
+    }
+}
+
+/// Skipping her question: this one, or every old one I got wrong.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Skip {
+    One,
+    AllOld,
+}
+
+/// "skip", "skip this question", "drop it", "next question"; "skip the old
+/// questions", "drop all of them". The whole utterance, give or take a
+/// polite word, so an answer that mentions skipping stays an answer.
+pub fn skip_command(text: &str) -> Option<Skip> {
+    const LEAD: &[&str] = &["okay", "ok", "alright", "no", "now", "please", "lasthope", "last", "hope", "so", "just", "let's", "lets"];
+    const TRAIL: &[&str] = &["please", "now", "lasthope", "last", "hope", "for", "me", "then"];
+    const VERB: &[&str] = &["skip", "drop", "forget", "remove", "delete"];
+    const ONE: &[&str] = &["it", "this", "that", "the", "question", "one"];
+    const ALL: &[&str] = &["all", "every", "them", "the", "old", "of", "questions", "wrong", "missed", "previous", "past", "review"];
+    let lower = text.to_lowercase().replace('’', "'");
+    let words: Vec<&str> = lower
+        .split(|c: char| !(c.is_alphanumeric() || c == '\''))
+        .filter(|w| !w.is_empty())
+        .collect();
+    let mut w: &[&str] = &words;
+    while let Some((first, rest)) = w.split_first() {
+        if LEAD.contains(first) { w = rest } else { break }
+    }
+    while let Some((last, rest)) = w.split_last() {
+        if TRAIL.contains(last) { w = rest } else { break }
+    }
+    if matches!(w, ["next", "question"] | ["the", "next", "question"]) {
+        return Some(Skip::One);
+    }
+    let (verb, rest) = w.split_first()?;
+    if !VERB.contains(verb) {
+        return None;
+    }
+    // "all", "them" or a plural turns it to every old question
+    let many = rest.iter().any(|x| matches!(*x, "all" | "every" | "them" | "questions"));
+    if many && rest.iter().all(|x| ALL.contains(x)) {
+        Some(Skip::AllOld)
+    } else if !many && rest.iter().all(|x| ONE.contains(x)) && (*verb == "skip" || !rest.is_empty()) {
+        Some(Skip::One)
+    } else {
+        None
     }
 }
 
@@ -898,6 +991,28 @@ mod tests {
     }
 
     #[test]
+    fn spoken_skips() {
+        for (said, expected) in [
+            ("Skip.", Some(Skip::One)),
+            ("Skip this question.", Some(Skip::One)),
+            ("Okay, skip it.", Some(Skip::One)),
+            ("Drop this one, please.", Some(Skip::One)),
+            ("Forget it.", Some(Skip::One)),
+            ("Next question.", Some(Skip::One)),
+            ("Skip all the old questions.", Some(Skip::AllOld)),
+            ("Drop them all.", Some(Skip::AllOld)),
+            ("Delete all the wrong questions.", Some(Skip::AllOld)),
+            ("Skip the review.", None),
+            ("Drop.", None),
+            ("Skip the gas refund part.", None),
+            ("We drop the old value from storage.", None),
+            ("What does skip mean?", None),
+        ] {
+            assert_eq!(skip_command(said), expected, "{said:?}");
+        }
+    }
+
+    #[test]
     fn extracted_text_is_tidied() {
         assert_eq!(tidy("  The ex-\nample  is\n\n  here.\n"), "The example is here.");
         assert_eq!(tidy("well-\nKnown"), "well- Known");
@@ -989,6 +1104,24 @@ mod tests {
         assert!(m.missed_questions(REASK).await.unwrap().is_empty());
         assert_eq!(m.question_tally().await.unwrap(), (3, 2));
         assert_eq!(m.questions(Some(a.id), 10).await.unwrap().len(), 3);
+
+        // a dropped question is not asked again, from any of its askings; restored, it is
+        let old = || sqlx::query("UPDATE questions SET asked_at = datetime('now', 'localtime', '-2 days')").execute(&m.pool);
+        let q3 = m.ask_question(a.id, 3, 0, "What is refunded?", None).await.unwrap();
+        m.judge_question(q3, false, "No.").await.unwrap();
+        let q3b = m.ask_question(a.id, 3, 0, "What is refunded?", Some(q3)).await.unwrap();
+        m.judge_question(q3b, false, "No.").await.unwrap();
+        old().await.unwrap();
+        assert_eq!(m.missed_questions(REASK).await.unwrap().len(), 1);
+        assert!(m.drop_question(q3b).await.unwrap());
+        assert!(!m.drop_question(q3).await.unwrap(), "already dropped");
+        assert!(m.missed_questions(REASK).await.unwrap().is_empty());
+        assert!(m.questions(None, 10).await.unwrap().iter().filter(|q| q.id == q3 || q.id == q3b).all(|q| q.dropped));
+        assert!(m.restore_question(q3).await.unwrap());
+        assert_eq!(m.missed_questions(REASK).await.unwrap().len(), 1);
+        // every old wrong question at once (one here: q1 was answered right since)
+        assert_eq!(m.drop_missed(None).await.unwrap(), 1);
+        assert!(m.missed_questions(REASK).await.unwrap().is_empty());
         let _ = std::fs::remove_file(&path);
     }
 }

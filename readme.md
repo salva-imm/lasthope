@@ -228,6 +228,13 @@ you, one page at a time.
   she has answered, she asks again up to two old questions you got wrong (never ones asked
   in the last twelve hours) and shows their pages. A question counts as learned once you
   answer it right.
+- **Skipping**: while a question waits, say **"skip"** (or "skip this question", "drop it",
+  "next question") and she moves on. An old question you got wrong is then dropped for good;
+  a new page's question is only passed over. **"Skip all the old questions"** (or "drop them
+  all") drops every old wrong question at once. Typed: `/skip`, `/skip all`. On the Grimoire
+  page, the question card has a Skip button, and each wrong question in "Questions asked" has
+  "Never ask again" (and "Ask it again" to bring a dropped one back). Dropped questions are
+  kept, marked in `dropped_questions`; nothing is deleted.
 - While a question waits, the judging call first decides whether what you said answers it.
   Anything else (another subject, a question of your own) gets an ordinary reply, is not
   graded, and the question stays open for later. Spoken commands still work, and "leave the

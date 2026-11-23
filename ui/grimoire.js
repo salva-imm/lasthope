@@ -169,8 +169,19 @@ function drawAsked() {
       el('p', { style: 'margin:0' }, q.question),
       q.answer ? el('p', { class: 'small', style: 'margin:0' }, el('span', { class: 'muted' }, 'You: '), q.answer) : null,
       el('span', { class: `small verdict ${q.correct === true ? 'right' : q.correct === false ? 'wrong' : ''}` },
-        verdict, q.judgement && q.correct !== null ? el('span', { class: 'muted' }, ` · ${q.judgement}`) : null));
+        verdict, q.judgement && q.correct !== null ? el('span', { class: 'muted' }, ` · ${q.judgement}`) : null),
+      q.correct === false ? dropControl(q) : null);
   }));
+}
+
+// a question I got wrong comes back in later sessions until I drop it
+function dropControl(q) {
+  return el('div', { class: 'row-between' },
+    el('span', { class: 'small muted' }, q.dropped ? 'Dropped: she will not ask it again' : ''),
+    el('button', {
+      type: 'button', class: 'btn quiet small-text',
+      onclick: () => line.send({ cmd: q.dropped ? 'restore_question' : 'drop_question', id: q.id }),
+    }, q.dropped ? 'Ask it again' : 'Never ask again'));
 }
 
 function drawReading() {
@@ -179,6 +190,8 @@ function drawReading() {
   if (asking) {
     $('question').textContent = reading.question;
     $('question-tag').textContent = reading.again ? 'Once answered wrong' : `${reading.title}, page ${reading.page}`;
+    $('skip').textContent = reading.again ? 'Drop it' : 'Skip';
+    $('skip').title = reading.again ? 'Never ask this old question again' : 'Pass over this question';
   }
   $('leave').hidden = !reading;
   $('her-line').hidden = !reading || !$('her-line').textContent;
@@ -263,6 +276,7 @@ $('read-next').onclick = () => line.send({ cmd: 'read', from: 'next' });
 $('read-oath').onclick = () => line.send({ cmd: 'read', from: 'oath' });
 $('read-random').onclick = () => line.send({ cmd: 'read', from: 'random' });
 $('leave').onclick = () => line.send({ cmd: 'leave_page' });
+$('skip').onclick = () => line.send({ cmd: 'skip_question' });
 $('reindex').onclick = () => line.send({ cmd: 'reindex' });
 $('answer').onsubmit = (e) => {
   e.preventDefault();

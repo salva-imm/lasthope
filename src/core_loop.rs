@@ -27,7 +27,7 @@ use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
 
 use crate::audio_in::{self, Gate, MicChoice};
-use crate::grimoire::{self, Page, Pick, ReadCmd, reading_command};
+use crate::grimoire::{self, Page, Pick, ReadCmd, Skip, reading_command, skip_command};
 use crate::llm::{self, ChatMessage, LlmClient, Sampling, Trouble};
 use crate::memory::{Memory, Speaker, VigilSource};
 use crate::persona::{self, Persona, Snapshot};
@@ -110,6 +110,16 @@ pub enum Command {
     ReadPage { book: i64, page: u32 },
     /// Close the book: no more questions on this page.
     LeavePage,
+    /// Pass over her open question; an old one I got wrong is never asked
+    /// again. `all`: drop every old wrong question.
+    SkipQuestion {
+        #[serde(default)]
+        all: bool,
+    },
+    /// Never ask this question again (an id from the questions asked).
+    DropQuestion { id: i64 },
+    /// Ask a dropped question again after all.
+    RestoreQuestion { id: i64 },
     /// Make a book the one being read.
     SetBook { book: i64 },
     /// Look through BOOKS_DIR again for new and changed PDFs.
@@ -820,6 +830,12 @@ impl Core {
             _ => text,
         };
         self.emit(Event::UserSpoke { text: text.to_string() });
+        if self.answering()
+            && let Some(skip) = skip_command(text)
+        {
+            self.skip_question(skip, true).await;
+            return Flow::Continue;
+        }
         match spoken_command(text) {
             Spoken::EndSession => {
                 let actions = self.rite.close_requested();
@@ -937,6 +953,23 @@ impl Core {
             Command::Read { from } => self.read(How::Pick(from), false).await,
             Command::ReadPage { book, page } => self.read(How::Page(book, page), false).await,
             Command::LeavePage => self.leave_page(false),
+            Command::SkipQuestion { all } => {
+                self.skip_question(if all { Skip::AllOld } else { Skip::One }, false).await
+            }
+            Command::DropQuestion { id } => match self.memory.drop_question(id).await {
+                Ok(_) => {
+                    self.notice("that question will not be asked again");
+                    self.emit(Event::ShelfChanged);
+                }
+                Err(e) => self.error("dropping the question", e),
+            },
+            Command::RestoreQuestion { id } => match self.memory.restore_question(id).await {
+                Ok(_) => {
+                    self.notice("that question may be asked again, if it was answered wrong");
+                    self.emit(Event::ShelfChanged);
+                }
+                Err(e) => self.error("restoring the question", e),
+            },
             Command::SetBook { book } => self.set_book(book).await,
             Command::Reindex => self.reindex(),
             Command::SetMic { mic } => self.set_mic(mic).await,
@@ -1591,29 +1624,73 @@ impl Core {
                     self.error("saving the verdict", e);
                 }
                 self.notice(format!("answer judged {}", if correct { "right" } else { "wrong" }));
-                let mut line = persona::clean_reply(&verdict);
-                let next = self.quiz.as_mut().and_then(|q| q.queue.pop_front());
-                if let Some(mut next) = next {
-                    if next.id == 0 {
-                        match self.memory.ask_question(next.page.book, next.page.page, self.session, &next.text, next.first_id).await {
-                            Ok(id) => next.id = id,
-                            Err(e) => self.error("saving the question", e),
-                        }
-                    }
-                    line += &match next.first_id {
-                        Some(_) => format!(" {}", missed_intro(&next, "Another you once missed")),
-                        None => format!(" Second question: {}", next.text),
-                    };
-                    if let Some(quiz) = self.quiz.as_mut() {
-                        quiz.shown = next.page.clone();
-                        quiz.current = Some(next);
-                    }
-                }
-                self.publish_reading();
-                self.say(line).await;
+                let line = persona::clean_reply(&verdict);
+                self.ask_next(line).await;
             }
         }
         Flow::Continue
+    }
+
+    /// Say `line`, then the next question waiting, if any.
+    async fn ask_next(&mut self, mut line: String) {
+        let next = self.quiz.as_mut().and_then(|q| q.queue.pop_front());
+        if let Some(mut next) = next {
+            if next.id == 0 {
+                match self.memory.ask_question(next.page.book, next.page.page, self.session, &next.text, next.first_id).await {
+                    Ok(id) => next.id = id,
+                    Err(e) => self.error("saving the question", e),
+                }
+            }
+            line += &match next.first_id {
+                Some(_) => format!(" {}", missed_intro(&next, "Another you once missed")),
+                None => format!(" Second question: {}", next.text),
+            };
+            if let Some(quiz) = self.quiz.as_mut() {
+                quiz.shown = next.page.clone();
+                quiz.current = Some(next);
+            }
+        }
+        self.publish_reading();
+        self.say(line).await;
+    }
+
+    /// Pass over the open question. One I once got wrong is dropped for good
+    /// (the Grimoire page can restore it); a new page's question is only
+    /// passed. `AllOld` drops every old wrong question, asked now or later.
+    async fn skip_question(&mut self, skip: Skip, speak: bool) {
+        if self.turn != Turn::Idle {
+            return self.notice("she is not done speaking");
+        }
+        let Some(current) = self.quiz.as_mut().and_then(|q| q.current.take()) else {
+            return self.tell("No question is waiting.", speak);
+        };
+        let old = current.first_id.is_some();
+        if old && let Err(e) = self.memory.drop_question(current.id).await {
+            self.error("dropping the question", e);
+        }
+        let line = match skip {
+            Skip::One => {
+                self.notice(if old { "skipped: that old question will not be asked again" } else { "question skipped" });
+                if old { "Dropped. I will not ask it again." } else { "Passed over." }.to_string()
+            }
+            Skip::AllOld => {
+                let n = match self.memory.drop_missed(None).await {
+                    Ok(n) => n,
+                    Err(e) => {
+                        self.error("dropping the old questions", e);
+                        0
+                    }
+                };
+                // and none of them follow now
+                if let Some(q) = self.quiz.as_mut() {
+                    q.queue.retain(|x| x.first_id.is_none());
+                }
+                self.notice(format!("dropped every old wrong question ({} in all)", n + u64::from(old)));
+                "The old questions are dropped. I will not ask them again.".to_string()
+            }
+        };
+        self.emit(Event::ShelfChanged);
+        self.ask_next(line).await;
     }
 
     /// A grimoire request failed: say so (not saved), and let her listen.

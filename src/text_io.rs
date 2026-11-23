@@ -32,6 +32,8 @@ commands:
   /search words           search everything ever said
   /read [next|oath|random]   read a page with her (next unread page by default)
   /page BOOK PAGE         read the page you choose;  /leave  closes the book
+  /skip [all]             pass over her question (an old wrong one is dropped for good;
+                          all: every old wrong question)
   /books                  the shelf;  /book N  makes book N the one you read
   /reindex                look through BOOKS_DIR again for new and changed PDFs
   /mic [N|auto|default|name]   the microphones; choose one (at once, kept across restarts)
@@ -138,6 +140,8 @@ fn parse_command(line: &str) -> Option<Result<Typed, String>> {
             }
         }
         ("leave", "") => cmd(Command::LeavePage),
+        ("skip", "") => cmd(Command::SkipQuestion { all: false }),
+        ("skip", "all") => cmd(Command::SkipQuestion { all: true }),
         ("books", "") => Ok(Typed::Query(Query::Books)),
         ("book", n) => match n.parse() {
             Ok(book) => cmd(Command::SetBook { book }),
@@ -370,6 +374,8 @@ mod tests {
         assert_eq!(parse_command("/end"), cmd(Command::EndSession));
         assert_eq!(parse_command("/kept"), cmd(Command::OathVerdict { kept: true }));
         assert_eq!(parse_command("/forget 12"), cmd(Command::ForgetFact { id: 12 }));
+        assert_eq!(parse_command("/skip"), cmd(Command::SkipQuestion { all: false }));
+        assert_eq!(parse_command("/skip all"), cmd(Command::SkipQuestion { all: true }));
         assert_eq!(
             parse_command("/mission Master Rust."),
             cmd(Command::SetMission { text: "Master Rust.".into() })
