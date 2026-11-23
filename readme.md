@@ -126,7 +126,9 @@ These spoken phrases are commands instead:
 
 - **"close the rite"** or **"end the session"** (on its own): ends the session.
 - **"begin the vigil"** / **"pause the vigil"** / **"reset the vigil"** (on their own; "start",
-  "resume", "hold", "timer" work too): see [The vigil](#the-vigil).
+  "resume", "hold", "timer" work too, and so does "I start a ten minute vigil"): see
+  [The vigil](#the-vigil). A start may open a longer sentence ("Let's start a ten minute
+  vigil. I'm reading chapter four."): the vigil starts and she answers the rest.
 - **"read the next page"** / **"read a random page"** / **"read a page for my oath"** /
   **"leave the page"**: see [The grimoire](#the-grimoire).
 - **"please say …"** (or "please generate …", "please store …"): the rest is

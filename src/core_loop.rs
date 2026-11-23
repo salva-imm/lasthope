@@ -315,8 +315,9 @@ enum Spoken {
     SaveWav(String),
     /// "close the rite", "end the session".
     EndSession,
-    /// "begin the vigil", "pause the vigil", "reset the vigil".
-    Vigil(VigilCmd),
+    /// "begin the vigil", "pause the vigil", "reset the vigil"; the command
+    /// may be the first sentence of more (`true`), which is then talk.
+    Vigil(VigilCmd, bool),
     /// "read the next page", "a random page", "leave the page".
     Read(ReadCmd),
     Talk,
@@ -358,7 +359,14 @@ fn spoken_command(text: &str) -> Spoken {
         return Spoken::EndSession;
     }
     if let Some(cmd) = vigil_command(text) {
-        return Spoken::Vigil(cmd);
+        return Spoken::Vigil(cmd, false);
+    }
+    // "Let's start a ten minute vigil. I'm going to read chapter four."
+    if let Some(end) = text.find(['.', '!'])
+        && !text[end + 1..].trim().is_empty()
+        && let Some(cmd @ VigilCmd::Start { .. }) = vigil_command(&text[..=end])
+    {
+        return Spoken::Vigil(cmd, true);
     }
     reading_command(text).map_or(Spoken::Talk, Spoken::Read)
 }
@@ -825,9 +833,17 @@ impl Core {
                 self.start_save(content);
                 Flow::Continue
             }
-            Spoken::Vigil(cmd) => {
+            Spoken::Vigil(cmd, false) => {
                 self.vigil_cmd(cmd, true);
                 Flow::Continue
+            }
+            // the vigil starts, and she answers the rest (she sees it running)
+            Spoken::Vigil(cmd, true) => {
+                self.vigil_cmd(cmd, false);
+                if let Err(e) = self.memory.add_message(self.session, Speaker::Me, text).await {
+                    self.error("saving what you said", e);
+                }
+                self.converse(text).await
             }
             Spoken::Read(ReadCmd::Read(pick)) => {
                 self.read(How::Pick(pick), true).await;
@@ -1739,8 +1755,15 @@ mod tests {
         assert_eq!(spoken_command("Close the rite."), Spoken::EndSession);
         assert_eq!(spoken_command("Okay, close the right now."), Spoken::EndSession);
         assert_eq!(spoken_command("End the session, Lasthope."), Spoken::EndSession);
-        assert_eq!(spoken_command("Begin the vigil."), Spoken::Vigil(VigilCmd::Start { minutes: None }));
-        assert_eq!(spoken_command("Pause the vigil."), Spoken::Vigil(VigilCmd::Pause));
+        assert_eq!(spoken_command("Begin the vigil."), Spoken::Vigil(VigilCmd::Start { minutes: None }, false));
+        assert_eq!(spoken_command("Pause the vigil."), Spoken::Vigil(VigilCmd::Pause, false));
+        assert_eq!(
+            spoken_command("Let's start a 10 minute vigil. I'm going to read Mastering Ethereum."),
+            Spoken::Vigil(VigilCmd::Start { minutes: Some(10) }, true)
+        );
+        // only a start leads talk; the rest must be there
+        assert_eq!(spoken_command("Pause the vigil. I need water."), Spoken::Talk);
+        assert_eq!(spoken_command("Start the vigil. "), Spoken::Vigil(VigilCmd::Start { minutes: None }, false));
         assert_eq!(spoken_command("I did a vigil."), Spoken::Talk);
         assert_eq!(spoken_command("We should end the session soon."), Spoken::Talk);
         assert_eq!(spoken_command("Talk to me, what is an oath?"), Spoken::Talk);

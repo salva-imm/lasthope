@@ -597,7 +597,8 @@ pub fn sounds_unfinished(text: &str) -> bool {
 }
 
 /// Drop Whisper's non-speech markers ("[BLANK_AUDIO]", "(wind blowing)") and
-/// anything left with no letters or digits.
+/// anything left that is no word: a lone letter or mark ("*g") is noise, a
+/// number is kept.
 fn clean_transcript(raw: &str) -> Option<String> {
     let mut out = String::with_capacity(raw.len());
     let mut depth = 0i32;
@@ -610,7 +611,8 @@ fn clean_transcript(raw: &str) -> Option<String> {
         }
     }
     let out = out.split_whitespace().collect::<Vec<_>>().join(" ");
-    out.chars().any(char::is_alphanumeric).then_some(out)
+    let letters = out.chars().filter(|c| c.is_alphabetic()).count();
+    (letters >= 2 || out.chars().any(|c| c.is_ascii_digit())).then_some(out)
 }
 
 #[cfg(test)]
@@ -801,6 +803,9 @@ mod tests {
     fn transcript_cleaning() {
         assert_eq!(clean_transcript(" [BLANK_AUDIO] "), None);
         assert_eq!(clean_transcript("(wind blowing) ..."), None);
+        assert_eq!(clean_transcript(" *g"), None);
+        assert_eq!(clean_transcript("42").as_deref(), Some("42"));
+        assert_eq!(clean_transcript("No.").as_deref(), Some("No."));
         assert_eq!(
             clean_transcript(" Talk to me,  (coughs) what is the EVM? "),
             Some("Talk to me, what is the EVM?".into())

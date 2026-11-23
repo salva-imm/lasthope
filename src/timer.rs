@@ -146,13 +146,19 @@ fn duration_at(t: &[String], i: usize) -> Option<(u32, usize)> {
 /// "begin the vigil", "start a fifty minute vigil", "pause the timer",
 /// "reset the vigil", give or take a polite word.
 pub fn vigil_command(text: &str) -> Option<VigilCmd> {
-    const LEAD: &[&str] = &["okay", "ok", "alright", "now", "lasthope", "last", "hope", "please", "let's", "lets", "so", "then"];
+    const LEAD: &[&str] = &[
+        "okay", "ok", "alright", "now", "lasthope", "last", "hope", "please", "let's", "lets", "so", "then",
+        "i", "i'll", "i'm", "we", "we'll", "will", "am", "going", "gonna", "to", "want", "wanna",
+    ];
     const TRAIL: &[&str] = &["now", "please", "lasthope", "last", "hope"];
     const START: &[&str] = &["begin", "start", "resume", "continue"];
     const PAUSE: &[&str] = &["pause", "hold", "stop", "halt"];
     const RESET: &[&str] = &["reset", "cancel", "clear", "abandon"];
     const FILL: &[&str] = &["the", "a", "an", "my", "our", "new", "of", "for", "another", "timer"];
 
+    if text.trim_end().ends_with('?') {
+        return None;
+    }
     let t = tokens(text);
     let mut a = 0;
     let mut b = t.len();
@@ -338,6 +344,11 @@ mod tests {
             ("I want to start the vigil after dinner.", None),
             ("Start the vigil with the EVM chapter.", None),
             ("Pause the 20 minute vigil", None),
+            ("I start a 10 minute vigil", Some(Start { minutes: Some(10) })),
+            ("I'm going to start a vigil.", Some(Start { minutes: None })),
+            ("We'll begin a thirty minute vigil.", Some(Start { minutes: Some(30) })),
+            ("I want to start a vigil", Some(Start { minutes: None })),
+            ("Start a vigil?", None),
         ] {
             assert_eq!(vigil_command(said), want, "{said:?}");
         }

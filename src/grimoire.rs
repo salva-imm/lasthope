@@ -762,9 +762,11 @@ pub fn judge_messages(persona: &str, page: &Page, question: &str, answer: &str, 
          asking you to repeat or explain the question, counts as answering. Anything else they \
          bring up instead (another subject, a question of their own, news of their day, a request) \
          is not an answer: then reply with {{\"answering\": false}} and nothing more.\n\
-         If it is an answer, judge it against the page text only. It is right if it holds the \
-         essential point, even in other words or briefly; it is wrong if it misses or contradicts \
-         the point, or if they do not know.\n\
+         If it is an answer, judge it against the page text only, and generously: this is spoken, \
+         from memory, not written. It is right if it names the core idea, even loosely, briefly or \
+         in other words, or if it names most of a list; it is wrong only if it misses or \
+         contradicts the point, or if they do not know. When it is right but incomplete, say it is \
+         right and add what was missing in one sentence.\n\
          Reply with JSON only, no prose around it: {{\"answering\": true, \"correct\": true or false, \"reply\": \"...\"}}\n\
          reply: one or two short spoken sentences. Say plainly whether they were right. If they \
          were wrong, give the right answer from the page in one sentence. {}",
